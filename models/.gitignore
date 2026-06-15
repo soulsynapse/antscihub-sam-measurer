@@ -1,0 +1,6 @@
+# Model weights are downloaded here at runtime.
+*
+
+# Keep this directory and its explanation in Git.
+!.gitignore
+!README.md

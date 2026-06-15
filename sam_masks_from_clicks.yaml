@@ -1,0 +1,83 @@
+﻿version: 1
+
+script:
+  id: "sam_masks_from_clicks"
+  name: "SAM Masks From Clicks"
+  description: "Interactive SAM click-to-mask stage with optional embedding precompute."
+  entrypoint: "sam_hover_mask_gui.py"
+
+inputs:
+  - key: source_input
+    label: Source Input
+    required: true
+    accepted_patterns:
+      - ".png"
+      - ".jpg"
+      - ".jpeg"
+      - ".bmp"
+      - ".tif"
+      - ".tiff"
+    match_mode: substring
+    allow_multiple_candidates: true
+    remember_user_pattern: true
+
+outputs:
+  - key: result_json
+    label: Result JSON
+    unique_string: ".sam_masks_from_clicks.result."
+    path_template: "{stem}.sam_masks_from_clicks.result.json"
+    temp_suffix: ".__tmp__"
+
+parameters:
+  schema:
+    type: object
+    properties:
+      open_results:
+        type: boolean
+        default: false
+        description: Launch GUI for interactive annotation in runner mode.
+      model_name:
+        type: string
+        default: "Segment-Anything (accuracy)"
+        description: Model preset name used to resolve or download ONNX weights.
+      encoder_path:
+        type: string
+        default: ""
+        description: Optional path to custom SAM encoder ONNX.
+      decoder_path:
+        type: string
+        default: ""
+        description: Optional path to custom SAM decoder ONNX.
+      mask_threshold:
+        type: number
+        default: 0.0
+        description: Initial GUI mask threshold when launching visual mode.
+      source_input:
+        type: string
+        default: ""
+        description: Optional GUI preload image path for direct mode.
+    required: []
+    additionalProperties: false
+
+invocation:
+  interpreter: python
+  args:
+    - "{script_path}"
+    - "--source-input"
+    - "{inputs.source_input.path}"
+    - "--output-result-json"
+    - "{outputs.result_json.temp_path}"
+    - "--params-json"
+    - "{params_json_path}"
+
+runtime:
+  headless: true
+  open_results_via_script: true
+  capture_stdout: true
+  capture_stderr: true
+  nonzero_exit_means_failure: true
+  supports_cancel: true
+
+completion:
+  finalize_outputs_via_atomic_rename: true
+  temp_outputs_never_count_as_inputs: true

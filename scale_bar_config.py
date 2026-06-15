@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+IMAGE_GLOBS_DEFAULT = "*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tif;*.tiff"
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+APPLIES_TO_PREVIEW_LIMIT_DEFAULT = 200
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Configure one scale bar calibration from a reference image and "
+            "apply it to all images in the source folder."
+        ),
+    )
+    parser.add_argument("--source-input", "--source-folder", dest="source_input")
+    parser.add_argument(
+        "--output-result-json",
+        "--output-scale-bar-config-json",
+        dest="output_result_json",
+    )
+    parser.add_argument("--params-json")
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Force direct GUI mode.",
+    )
+    parser.add_argument(
+        "--gui-source-input",
+        default="",
+        help="Optional source folder/image when launching GUI directly.",
+    )
+    parser.add_argument(
+        "--gui-params-json",
+        default="",
+        help="Optional params JSON path for GUI preload.",
+    )
+    return parser.parse_args()
+
+
+def has_text(raw: str | None) -> bool:
+    return isinstance(raw, str) and bool(raw.strip())
+
+
+def bring_tk_window_to_front(window: Any) -> None:
+    try:
+        window.deiconify()
+        window.lift()
+        window.attributes("-topmost", True)
+        window.focus_force()
+        window.after(600, lambda: window.attributes("-topmost", False))
+    except Exception:
+        pass
+
+
+def parse_bool_like(raw: Any) -> bool | None:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+
+def as_bool(params: dict[str, Any], key: str, default: bool) -> bool:
+    raw = params.get(key, default)
+    parsed = parse_bool_like(raw)
+    if parsed is not None:
+        return parsed
+    return bool(default)
+
+
+def as_float(params: dict[str, Any], key: str, default: float) -> float:
+    raw = params.get(key, default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def as_int(params: dict[str, Any], key: str, default: int) -> int:
+    raw = params.get(key, default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def as_str(params: dict[str, Any], key: str, default: str) -> str:
+    raw = params.get(key, default)
+    if isinstance(raw, str):
+        return raw
+    return str(default)
+
+
+def resolve_run_mode() -> str:
+    run_mode = os.environ.get("PIPEYARD_RUN_MODE", "").strip().lower()
+    if run_mode in {"visual", "headless"}:
+        return run_mode
+
+    visual = parse_bool_like(os.environ.get("PIPEYARD_VISUAL_MODE"))
+    if visual is True:
+        return "visual"
+
+    headless = parse_bool_like(os.environ.get("PIPEYARD_HEADLESS"))
+    if headless is True:
+        return "headless"
+
+    return "headless"
+
+
+def load_json_object(params_path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(params_path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read JSON file: {params_path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"JSON file must contain an object: {params_path}")
+    return payload
+
+
+def load_json_object_optional(raw_path: str) -> dict[str, Any]:
+    text = str(raw_path or "").strip()
+    if not text:
+        return {}
+    path = Path(text).expanduser().resolve()
+    if not path.exists():
+        raise RuntimeError(f"JSON file does not exist: {path}")
+    return load_json_object(path)
+
+
+def require_pillow_image() -> Any:
+    try:
+        from PIL import Image
+    except Exception as exc:
+        raise RuntimeError(
+            "This stage requires Pillow. Install dependency: Pillow>=10.4.0"
+        ) from exc
+    return Image
+
+
+def parse_glob_patterns(raw: str) -> list[str]:
+    text = str(raw or "").strip()
+    if not text:
+        text = IMAGE_GLOBS_DEFAULT
+
+    pieces = [piece.strip() for piece in text.replace(",", ";").split(";") if piece.strip()]
+    return pieces or IMAGE_GLOBS_DEFAULT.split(";")
+
+
+def collect_image_candidates(source_dir: Path, patterns: list[str]) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    for pattern in patterns:
+        for path in sorted(source_dir.glob(pattern)):
+            if not path.is_file():
+                continue
+            suffix = path.suffix.lower()
+            if suffix not in IMAGE_SUFFIXES:
+                continue
+            key = str(path.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(path.resolve())
+
+    if candidates:
+        return candidates
+
+    for path in sorted(source_dir.iterdir()):
+        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
+            candidates.append(path.resolve())
+    return candidates
+
+
+def resolve_reference_and_applicability(
+    source_input: Path,
+    params: dict[str, Any],
+) -> tuple[Path, list[Path], Path | None]:
+    patterns = parse_glob_patterns(as_str(params, "image_glob", IMAGE_GLOBS_DEFAULT))
+
+    if source_input.is_file():
+        if source_input.suffix.lower() not in IMAGE_SUFFIXES:
+            raise RuntimeError(
+                f"Source file must be an image ({', '.join(sorted(IMAGE_SUFFIXES))}): {source_input}"
+            )
+        resolved_file = source_input.resolve()
+        folder_path = resolved_file.parent.resolve()
+        applicable_images = collect_image_candidates(folder_path, patterns)
+        if not applicable_images:
+            applicable_images = [resolved_file]
+        return resolved_file, applicable_images, folder_path
+
+    if not source_input.is_dir():
+        raise RuntimeError(f"Source input must be an image file or a directory: {source_input}")
+
+    resolved_dir = source_input.resolve()
+    images = collect_image_candidates(resolved_dir, patterns)
+    if not images:
+        raise RuntimeError(f"No images found in directory: {source_input}")
+
+    image_index = max(0, as_int(params, "image_index", 0))
+    if image_index >= len(images):
+        image_index = len(images) - 1
+    return images[image_index], images, resolved_dir
+
+
+def parse_point_value(raw: Any, key_name: str) -> tuple[float, float]:
+    if isinstance(raw, dict):
+        if "x" not in raw or "y" not in raw:
+            raise RuntimeError(f"{key_name} dict must contain x and y.")
+        return float(raw["x"]), float(raw["y"])
+
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        return float(raw[0]), float(raw[1])
+
+    raise RuntimeError(f"{key_name} must be an object {{x, y}} or a list [x, y].")
+
+
+def parse_json_or_value(raw: Any) -> Any:
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to parse JSON value: {text}") from exc
+    return raw
+
+
+def parse_points_from_params(params: dict[str, Any]) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    if "point_a" in params and "point_b" in params:
+        point_a = parse_point_value(params["point_a"], "point_a")
+        point_b = parse_point_value(params["point_b"], "point_b")
+        return point_a, point_b
+
+    if "point_a_json" in params and "point_b_json" in params:
+        raw_a = parse_json_or_value(params.get("point_a_json"))
+        raw_b = parse_json_or_value(params.get("point_b_json"))
+        if raw_a is not None and raw_b is not None:
+            point_a = parse_point_value(raw_a, "point_a_json")
+            point_b = parse_point_value(raw_b, "point_b_json")
+            return point_a, point_b
+
+    if "points_json" in params:
+        raw_points = parse_json_or_value(params.get("points_json"))
+        if isinstance(raw_points, list) and len(raw_points) >= 2:
+            point_a = parse_point_value(raw_points[0], "points_json[0]")
+            point_b = parse_point_value(raw_points[1], "points_json[1]")
+            return point_a, point_b
+
+    if "points" in params:
+        raw_points = params.get("points")
+        if isinstance(raw_points, list) and len(raw_points) >= 2:
+            point_a = parse_point_value(raw_points[0], "points[0]")
+            point_b = parse_point_value(raw_points[1], "points[1]")
+            return point_a, point_b
+
+    return None
+
+
+def build_result_payload(
+    *,
+    source_input: Path,
+    image_path: Path,
+    point_a: tuple[float, float],
+    point_b: tuple[float, float],
+    known_length: float,
+    length_unit: str,
+    params: dict[str, Any],
+    selection_mode: str,
+    applicable_image_paths: list[Path],
+    applies_to_folder: Path | None,
+    image_size: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    if known_length <= 0:
+        raise RuntimeError("known_length must be greater than zero.")
+
+    if image_size is None:
+        Image = require_pillow_image()
+        with Image.open(image_path) as image:
+            image_width, image_height = image.size
+    else:
+        image_width, image_height = image_size
+
+    dx = float(point_b[0]) - float(point_a[0])
+    dy = float(point_b[1]) - float(point_a[1])
+    pixel_distance = float(math.hypot(dx, dy))
+    if pixel_distance <= 0:
+        raise RuntimeError("Selected points must not be identical.")
+
+    pixels_per_unit = pixel_distance / known_length
+    units_per_pixel = known_length / pixel_distance
+    preview_limit = max(
+        1,
+        as_int(params, "applies_to_preview_limit", APPLIES_TO_PREVIEW_LIMIT_DEFAULT),
+    )
+    selected_index = -1
+    for index, candidate in enumerate(applicable_image_paths):
+        if candidate.resolve() == image_path.resolve():
+            selected_index = index
+            break
+
+    scope = "single_image"
+    if applies_to_folder is not None:
+        scope = "all_images_in_folder"
+
+    return {
+        "stage_id": "scale_bar_config",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "selection_mode": selection_mode,
+        "source_input": str(source_input),
+        "selected_image_path": str(image_path),
+        "selected_image_name": image_path.name,
+        "image_size": {
+            "width": int(image_width),
+            "height": int(image_height),
+        },
+        "scale_bar": {
+            "point_a": {"x": float(point_a[0]), "y": float(point_a[1])},
+            "point_b": {"x": float(point_b[0]), "y": float(point_b[1])},
+            "pixel_distance": pixel_distance,
+            "known_length": float(known_length),
+            "length_unit": str(length_unit),
+            "pixels_per_unit": pixels_per_unit,
+            "units_per_pixel": units_per_pixel,
+        },
+        "applies_to": {
+            "scope": scope,
+            "folder_path": str(applies_to_folder) if applies_to_folder is not None else None,
+            "image_count": len(applicable_image_paths),
+            "reference_image_index": selected_index,
+            "image_glob_used": as_str(params, "image_glob", IMAGE_GLOBS_DEFAULT),
+            "image_names_preview": [path.name for path in applicable_image_paths[:preview_limit]],
+            "preview_truncated": len(applicable_image_paths) > preview_limit,
+        },
+        "parameters_used": {
+            "image_index": max(0, as_int(params, "image_index", 0)),
+            "image_glob": as_str(params, "image_glob", IMAGE_GLOBS_DEFAULT),
+            "applies_to_preview_limit": preview_limit,
+            "open_results": as_bool(params, "open_results", False),
+        },
+    }
+
+
+def direct_output_path_for_payload(payload: dict[str, Any]) -> Path:
+    selected_image = str(payload.get("selected_image_path") or "").strip()
+    if selected_image:
+        image_path = Path(selected_image).expanduser().resolve()
+        output_dir = image_path.parent
+        stem = image_path.stem
+    else:
+        source_input = str(payload.get("source_input") or "").strip()
+        output_dir = Path(source_input).expanduser().resolve().parent if source_input else Path.cwd().resolve()
+        stem = Path(source_input).stem if source_input else "scale_bar_config"
+    stem = stem or "scale_bar_config"
+    return output_dir / f"{stem}.scale_bar_config.result.json"
+
+
+def write_result_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def launch_gui(initial_source_input: Path | None, params: dict[str, Any]) -> dict[str, Any]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox, ttk
+        from PIL import ImageTk
+    except Exception as exc:
+        raise RuntimeError(
+            "GUI mode requires tkinter and Pillow ImageTk support in this environment."
+        ) from exc
+    Image = require_pillow_image()
+
+    source_input: Path | None = initial_source_input
+    if source_input is None:
+        chooser = tk.Tk()
+        chooser.withdraw()
+        chooser.attributes("-topmost", True)
+        chooser.update_idletasks()
+        chosen_image = filedialog.askopenfilename(
+            parent=chooser,
+            title="Choose a reference image",
+            filetypes=[
+                ("Image Files", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"),
+                ("All Files", "*.*"),
+            ],
+        )
+        chooser.destroy()
+        if not chosen_image:
+            raise RuntimeError("No source image selected.")
+        source_input = Path(chosen_image).expanduser().resolve()
+    else:
+        source_input = source_input.expanduser().resolve()
+
+    image_path, applicable_image_paths, applies_to_folder = resolve_reference_and_applicability(
+        source_input,
+        params,
+    )
+
+    with Image.open(image_path) as source_image:
+        image_rgb = source_image.convert("RGB")
+        original_size = source_image.size
+
+    max_width = max(400, as_int(params, "preview_max_width", 1400))
+    max_height = max(300, as_int(params, "preview_max_height", 900))
+    scale = min(1.0, max_width / float(original_size[0]), max_height / float(original_size[1]))
+    display_size = (
+        max(1, int(round(original_size[0] * scale))),
+        max(1, int(round(original_size[1] * scale))),
+    )
+
+    if display_size != original_size:
+        preview_image = image_rgb.resize(display_size, Image.Resampling.LANCZOS)
+    else:
+        preview_image = image_rgb
+
+    preloaded_points = parse_points_from_params(params)
+
+    known_length_default = as_float(params, "known_length", 1.0)
+    if known_length_default <= 0:
+        known_length_default = 1.0
+    unit_default = as_str(params, "length_unit", "mm").strip() or "mm"
+
+    class ScaleBarWindow:
+        def __init__(self) -> None:
+            self.root = tk.Tk()
+            self.root.title("Scale Bar Config")
+            self.root.geometry("1700x980")
+            self.root.after(100, lambda: bring_tk_window_to_front(self.root))
+            self.result: dict[str, Any] | None = None
+            self.points: list[tuple[float, float]] = []
+
+            self.known_length_var = tk.StringVar(value=f"{known_length_default}")
+            self.unit_var = tk.StringVar(value=unit_default)
+            self.distance_var = tk.StringVar(value="Pixel distance: not set")
+            self.scale_var = tk.StringVar(value="Scale: not set")
+
+            outer = ttk.Frame(self.root, padding=10)
+            outer.pack(fill="both", expand=True)
+
+            controls = ttk.Frame(outer, width=360)
+            controls.pack(side="left", fill="y")
+
+            preview = ttk.Frame(outer)
+            preview.pack(side="right", fill="both", expand=True, padx=(12, 0))
+
+            ttk.Label(controls, text="Scale Bar Setup", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+            ttk.Label(controls, text=f"Image: {image_path.name}", wraplength=340).pack(anchor="w", pady=(8, 2))
+            if applies_to_folder is not None:
+                ttk.Label(
+                    controls,
+                    text=(
+                        "Applies to all images in folder: "
+                        f"{applies_to_folder} (count: {len(applicable_image_paths)})"
+                    ),
+                    wraplength=340,
+                ).pack(anchor="w", pady=(0, 6))
+            ttk.Label(
+                controls,
+                text="Click two points on the preview. The third click starts a new pair.",
+                wraplength=340,
+            ).pack(anchor="w", pady=(0, 10))
+
+            ttk.Label(controls, text="Known Length").pack(anchor="w")
+            ttk.Entry(controls, textvariable=self.known_length_var, width=24).pack(anchor="w", pady=(2, 8))
+
+            ttk.Label(controls, text="Length Unit").pack(anchor="w")
+            ttk.Entry(controls, textvariable=self.unit_var, width=24).pack(anchor="w", pady=(2, 12))
+
+            ttk.Label(controls, textvariable=self.distance_var, wraplength=340).pack(anchor="w", pady=(0, 4))
+            ttk.Label(controls, textvariable=self.scale_var, wraplength=340).pack(anchor="w", pady=(0, 12))
+
+            button_row = ttk.Frame(controls)
+            button_row.pack(anchor="w", pady=(4, 0))
+            ttk.Button(button_row, text="Reset Points", command=self.reset_points).pack(side="left")
+            ttk.Button(button_row, text="Accept", command=self.accept).pack(side="left", padx=(8, 0))
+            ttk.Button(button_row, text="Cancel", command=self.cancel).pack(side="left", padx=(8, 0))
+
+            self.photo = ImageTk.PhotoImage(preview_image)
+            self.canvas = tk.Canvas(
+                preview,
+                width=display_size[0],
+                height=display_size[1],
+                background="#101010",
+                highlightthickness=0,
+            )
+            self.canvas.pack(fill="both", expand=True)
+            self.canvas_image_id = self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+            self.canvas.bind("<Button-1>", self.on_click)
+
+            if preloaded_points is not None:
+                self.points = [(float(preloaded_points[0][0]), float(preloaded_points[0][1])), (float(preloaded_points[1][0]), float(preloaded_points[1][1]))]
+
+            self.redraw()
+
+        def _to_canvas_xy(self, point: tuple[float, float]) -> tuple[float, float]:
+            return point[0] * scale, point[1] * scale
+
+        def _to_image_xy(self, x: float, y: float) -> tuple[float, float]:
+            return x / scale, y / scale
+
+        def redraw(self) -> None:
+            self.canvas.delete("scale_overlay")
+
+            for index, point in enumerate(self.points):
+                cx, cy = self._to_canvas_xy(point)
+                radius = 5
+                color = "#50e3c2" if index == 0 else "#ff8c42"
+                self.canvas.create_oval(
+                    cx - radius,
+                    cy - radius,
+                    cx + radius,
+                    cy + radius,
+                    outline=color,
+                    width=2,
+                    tags="scale_overlay",
+                )
+
+            if len(self.points) == 2:
+                p0x, p0y = self._to_canvas_xy(self.points[0])
+                p1x, p1y = self._to_canvas_xy(self.points[1])
+                self.canvas.create_line(
+                    p0x,
+                    p0y,
+                    p1x,
+                    p1y,
+                    fill="#ffd166",
+                    width=2,
+                    tags="scale_overlay",
+                )
+                pixel_distance = float(math.hypot(
+                    self.points[1][0] - self.points[0][0],
+                    self.points[1][1] - self.points[0][1],
+                ))
+                self.distance_var.set(f"Pixel distance: {pixel_distance:.4f}px")
+                known = self._known_length_or_none()
+                if known is not None:
+                    unit = self.unit_var.get().strip() or "units"
+                    self.scale_var.set(
+                        f"Scale: {pixel_distance / known:.6f} px/{unit} ({known / pixel_distance:.6f} {unit}/px)"
+                    )
+                else:
+                    self.scale_var.set("Scale: enter a known length greater than zero.")
+            else:
+                self.distance_var.set("Pixel distance: not set")
+                self.scale_var.set("Scale: not set")
+
+        def _known_length_or_none(self) -> float | None:
+            try:
+                value = float(self.known_length_var.get())
+            except ValueError:
+                return None
+            if value <= 0:
+                return None
+            return value
+
+        def on_click(self, event: Any) -> None:
+            x = float(event.x)
+            y = float(event.y)
+            if x < 0 or y < 0 or x > display_size[0] or y > display_size[1]:
+                return
+
+            point = self._to_image_xy(x, y)
+            if len(self.points) >= 2:
+                self.points = [point]
+            else:
+                self.points.append(point)
+            self.redraw()
+
+        def reset_points(self) -> None:
+            self.points = []
+            self.redraw()
+
+        def accept(self) -> None:
+            if len(self.points) != 2:
+                messagebox.showerror("Scale Bar Config", "Select exactly two points before accepting.")
+                return
+
+            known_length = self._known_length_or_none()
+            if known_length is None:
+                messagebox.showerror("Scale Bar Config", "Known length must be a positive number.")
+                return
+
+            length_unit = self.unit_var.get().strip() or "units"
+            self.result = build_result_payload(
+                source_input=source_input,
+                image_path=image_path,
+                point_a=self.points[0],
+                point_b=self.points[1],
+                known_length=known_length,
+                length_unit=length_unit,
+                params=params,
+                selection_mode="gui",
+                applicable_image_paths=applicable_image_paths,
+                applies_to_folder=applies_to_folder,
+                image_size=original_size,
+            )
+            self.root.destroy()
+
+        def cancel(self) -> None:
+            self.root.destroy()
+
+        def run(self) -> dict[str, Any]:
+            self.root.mainloop()
+            if self.result is None:
+                raise RuntimeError("Scale bar setup was cancelled before completion.")
+            return self.result
+
+    window = ScaleBarWindow()
+    return window.run()
+
+
+def run_stage_for_runner(source_input: Path, params: dict[str, Any]) -> dict[str, Any]:
+    run_mode = resolve_run_mode()
+    open_results = as_bool(params, "open_results", False)
+    if run_mode == "visual" or open_results:
+        payload = launch_gui(source_input, params)
+        payload["action"] = "open_results"
+        payload["run_mode"] = run_mode
+        payload["open_results"] = open_results
+        return payload
+
+    points = parse_points_from_params(params)
+    if points is None:
+        raise RuntimeError(
+            "Headless mode needs scale points in params. Provide one of: "
+            "point_a + point_b, point_a_json + point_b_json, points, or points_json."
+        )
+
+    known_length = as_float(params, "known_length", 0.0)
+    if known_length <= 0:
+        raise RuntimeError("Headless mode requires params.known_length > 0.")
+    length_unit = as_str(params, "length_unit", "mm").strip() or "mm"
+
+    image_path, applicable_image_paths, applies_to_folder = resolve_reference_and_applicability(
+        source_input,
+        params,
+    )
+    payload = build_result_payload(
+        source_input=source_input,
+        image_path=image_path,
+        point_a=points[0],
+        point_b=points[1],
+        known_length=known_length,
+        length_unit=length_unit,
+        params=params,
+        selection_mode="params",
+        applicable_image_paths=applicable_image_paths,
+        applies_to_folder=applies_to_folder,
+    )
+    payload["action"] = "process"
+    payload["run_mode"] = run_mode
+    payload["open_results"] = open_results
+    return payload
+
+
+def main() -> int:
+    args = parse_args()
+
+    has_source = has_text(args.source_input)
+    has_output = has_text(args.output_result_json)
+    has_params = has_text(args.params_json)
+
+    full_runner_mode = has_source and has_output and has_params
+
+    if args.gui:
+        gui_source_raw = args.gui_source_input or args.source_input or ""
+        gui_source = Path(gui_source_raw).expanduser().resolve() if has_text(gui_source_raw) else None
+        gui_params_raw = args.gui_params_json or args.params_json or ""
+        gui_params = load_json_object_optional(gui_params_raw)
+        payload = launch_gui(gui_source, gui_params)
+        output_result_json = (
+            Path(str(args.output_result_json)).expanduser().resolve()
+            if has_output
+            else direct_output_path_for_payload(payload)
+        )
+        payload["output_result_json"] = str(output_result_json)
+        write_result_json(output_result_json, payload)
+        print(f"Wrote result JSON: {output_result_json}", flush=True)
+        print(json.dumps(payload, indent=2), flush=True)
+        return 0
+
+    if full_runner_mode:
+        source_input = Path(str(args.source_input)).expanduser().resolve()
+        if not source_input.exists():
+            raise RuntimeError(f"Source input does not exist: {source_input}")
+
+        output_result_json = Path(str(args.output_result_json)).expanduser().resolve()
+        params_path = Path(str(args.params_json)).expanduser().resolve()
+        params = load_json_object(params_path)
+
+        payload = run_stage_for_runner(source_input, params)
+        payload.setdefault("source_exists", source_input.exists())
+
+        write_result_json(output_result_json, payload)
+        print(f"Wrote result JSON: {output_result_json}", flush=True)
+        return 0
+
+    # Direct/manual mode:
+    # - no runner args
+    # - source-only
+    # - params-only (used as GUI preload)
+    if has_output:
+        raise RuntimeError(
+            "Partial runner args detected. If --output-result-json is provided, also provide "
+            "--source-input and --params-json."
+        )
+
+    gui_source_raw = args.gui_source_input or args.source_input or ""
+    gui_source = Path(gui_source_raw).expanduser().resolve() if has_text(gui_source_raw) else None
+    gui_params_raw = args.gui_params_json or args.params_json or ""
+    gui_params = load_json_object_optional(gui_params_raw)
+    payload = launch_gui(gui_source, gui_params)
+    output_result_json = direct_output_path_for_payload(payload)
+    payload["output_result_json"] = str(output_result_json)
+    write_result_json(output_result_json, payload)
+    print(f"Wrote result JSON: {output_result_json}", flush=True)
+    print(json.dumps(payload, indent=2), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

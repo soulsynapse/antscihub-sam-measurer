@@ -1,0 +1,4 @@
+numpy>=1.26.4
+Pillow>=10.4.0
+onnxruntime>=1.23.2
+gdown>=5.2.0

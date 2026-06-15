@@ -1,0 +1,42 @@
+antscihub-sam-measurer License and Attribution Notice
+
+Copyright (c) 2026 antscihub-sam-measurer contributors.
+
+This project is licensed under the Creative Commons
+Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0):
+
+https://creativecommons.org/licenses/by-nc/4.0/
+
+You may share and adapt this project for noncommercial purposes, provided that
+you give appropriate credit, provide a link to the license, indicate whether
+changes were made, and do not imply endorsement by the authors or by upstream
+projects.
+
+Noncommercial restriction:
+
+This project may not be used for commercial purposes unless you obtain separate
+permission from the relevant copyright holders.
+
+No warranty:
+
+This project is provided as-is, without warranties or conditions of any kind.
+
+Annolid attribution:
+
+This project was heavily inspired by Annolid, an annotation and instance
+segmentation-based multiple animal tracking and behavior analysis package:
+
+https://github.com/cplab/annolid
+https://annolid.com/
+
+Annolid is copyright (c) 2024 Computational Physiology Laboratory and is
+distributed under the Creative Commons Attribution-NonCommercial 4.0
+International License.
+
+This project was made because I could not figure out how to get Annolid working
+for my workflow, but Annolid's methods were clear enough to guide a smaller,
+focused implementation for SAM-based measurement.
+
+This project is not affiliated with, sponsored by, or endorsed by Annolid or the
+Computational Physiology Laboratory. Any changes, simplifications, omissions, or
+errors in this project are the responsibility of this project's contributors.
