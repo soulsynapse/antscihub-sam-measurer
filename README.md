@@ -2,6 +2,8 @@
 
 Lightweight desktop GUI to measure things using SAM.
 
+![SAM measurer GUI example](docs/images/sam-measurer-example.png)
+
 ## General Workflow
 
 1. Run scale-bar config on the image that contains the scale bar.
