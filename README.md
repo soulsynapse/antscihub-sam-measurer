@@ -14,7 +14,17 @@ Lightweight desktop GUI to measure things using SAM.
    press `Accept`. This writes
    `<scale-bar-image-stem>.scale_bar_config.result.json` next to that image.
 
-2. Run the SAM mask GUI on the images you want to measure.
+2. Optionally precompute SAM embeddings overnight.
+
+   ```powershell
+   python antscihub-sam-measurer/precompute_embeddings.py --source-folder "path\to\image-folder"
+   ```
+
+   This walks the folder and all subfolders, downloads the selected model if
+   needed, skips fresh embedding caches, and writes the same
+   `<image>.<hash>.sam_embedding.npz` files that the GUI uses.
+
+3. Run the SAM mask GUI on the images you want to measure.
 
    ```powershell
    python antscihub-sam-measurer/sam_hover_mask_gui.py
@@ -23,7 +33,7 @@ Lightweight desktop GUI to measure things using SAM.
    Open images from the same folder, click objects to create masks, and let the
    GUI autosave each image's `.sam_clicks.json` and `.sam_clicks.npz` files.
 
-3. Export the folder measurements to CSV.
+4. Export the folder measurements to CSV.
 
    ```powershell
    python antscihub-sam-measurer/folder-to-csv.py --source-folder "path\to\image-folder"
@@ -89,6 +99,25 @@ Runner mode also writes its configured result JSON, typically named like:
 
 That result JSON points to the annotation files and reports saved mask counts and
 total mask area.
+
+## Precompute Embeddings
+
+To precompute embeddings recursively for a folder tree:
+
+```powershell
+python antscihub-sam-measurer/precompute_embeddings.py --source-folder "path\to\image-folder"
+```
+
+If no folder is provided, the script opens a folder picker. It uses
+`Segment-Anything (accuracy)` by default, downloads missing ONNX weights, and
+skips images whose embedding cache is already fresh. Use `--force` to recompute
+everything.
+
+Optional summary file:
+
+```powershell
+python antscihub-sam-measurer/precompute_embeddings.py --source-folder "path\to\image-folder" --summary-json "path\to\summary.json"
+```
 
 ## Scale Bar Config
 
