@@ -14,7 +14,7 @@ Lightweight desktop GUI to measure things using SAM.
    press `Accept`. This writes
    `<scale-bar-image-stem>.scale_bar_config.result.json` next to that image.
 
-2. Optionally precompute SAM embeddings overnight.
+2. Run `precompute_embeddings.py` to precompute SAM embeddings overnight.
 
    ```powershell
    python antscihub-sam-measurer/precompute_embeddings.py --source-folder "path\to\image-folder"
@@ -22,7 +22,9 @@ Lightweight desktop GUI to measure things using SAM.
 
    This walks the folder and all subfolders, downloads the selected model if
    needed, skips fresh embedding caches, and writes the same
-   `<image>.<hash>.sam_embedding.npz` files that the GUI uses.
+   `<image>.<hash>.sam_embedding.npz` files that the GUI uses. You can skip
+   this step for small batches, but it is the recommended overnight preparation
+   step before clicking masks in the morning.
 
 3. Run the SAM mask GUI on the images you want to measure.
 
