@@ -358,16 +358,20 @@ def build_result_payload(
     }
 
 
+def direct_output_path_for_image(image_path: Path) -> Path:
+    stem = image_path.stem or "scale_bar_config"
+    return image_path.parent / f"{stem}.scale_bar_config.result.json"
+
+
 def direct_output_path_for_payload(payload: dict[str, Any]) -> Path:
     selected_image = str(payload.get("selected_image_path") or "").strip()
     if selected_image:
         image_path = Path(selected_image).expanduser().resolve()
-        output_dir = image_path.parent
-        stem = image_path.stem
-    else:
-        source_input = str(payload.get("source_input") or "").strip()
-        output_dir = Path(source_input).expanduser().resolve().parent if source_input else Path.cwd().resolve()
-        stem = Path(source_input).stem if source_input else "scale_bar_config"
+        return direct_output_path_for_image(image_path)
+
+    source_input = str(payload.get("source_input") or "").strip()
+    output_dir = Path(source_input).expanduser().resolve().parent if source_input else Path.cwd().resolve()
+    stem = Path(source_input).stem if source_input else "scale_bar_config"
     stem = stem or "scale_bar_config"
     return output_dir / f"{stem}.scale_bar_config.result.json"
 
@@ -377,7 +381,72 @@ def write_result_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def launch_gui(initial_source_input: Path | None, params: dict[str, Any]) -> dict[str, Any]:
+def point_is_inside_image(point: tuple[float, float], image_size: tuple[int, int]) -> bool:
+    return 0 <= point[0] < image_size[0] and 0 <= point[1] < image_size[1]
+
+
+def parse_scale_bar_preload_payload(
+    payload: dict[str, Any],
+    image_path: Path,
+    image_size: tuple[int, int],
+) -> tuple[tuple[float, float], tuple[float, float], float, str] | None:
+    if payload.get("stage_id") not in {None, "scale_bar_config"}:
+        return None
+
+    selected_image = str(payload.get("selected_image_path") or "").strip()
+    if selected_image:
+        try:
+            if Path(selected_image).expanduser().resolve() != image_path.resolve():
+                return None
+        except Exception:
+            return None
+
+    scale_bar = payload.get("scale_bar")
+    if not isinstance(scale_bar, dict):
+        return None
+
+    try:
+        point_a = parse_point_value(scale_bar.get("point_a"), "scale_bar.point_a")
+        point_b = parse_point_value(scale_bar.get("point_b"), "scale_bar.point_b")
+        known_length = float(scale_bar.get("known_length"))
+    except Exception:
+        return None
+
+    if known_length <= 0:
+        return None
+    if not point_is_inside_image(point_a, image_size) or not point_is_inside_image(point_b, image_size):
+        return None
+
+    length_unit = str(scale_bar.get("length_unit") or "mm").strip() or "mm"
+    return point_a, point_b, known_length, length_unit
+
+
+def load_scale_bar_preload(
+    image_path: Path,
+    image_size: tuple[int, int],
+    candidate_paths: list[Path],
+) -> tuple[tuple[float, float], tuple[float, float], float, str] | None:
+    seen: set[str] = set()
+    for path in candidate_paths:
+        resolved_path = path.expanduser().resolve()
+        key = str(resolved_path).lower()
+        if key in seen or not resolved_path.is_file():
+            continue
+        seen.add(key)
+
+        try:
+            payload = load_json_object(resolved_path)
+        except Exception:
+            continue
+
+        parsed = parse_scale_bar_preload_payload(payload, image_path, image_size)
+        if parsed is not None:
+            return parsed
+
+    return None
+
+
+def launch_gui(initial_source_input: Path | None, params: dict[str, Any], existing_result_path: Path | None = None) -> dict[str, Any]:
     try:
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
@@ -420,29 +489,52 @@ def launch_gui(initial_source_input: Path | None, params: dict[str, Any]) -> dic
 
     max_width = max(400, as_int(params, "preview_max_width", 1400))
     max_height = max(300, as_int(params, "preview_max_height", 900))
-    scale = min(1.0, max_width / float(original_size[0]), max_height / float(original_size[1]))
-    display_size = (
-        max(1, int(round(original_size[0] * scale))),
-        max(1, int(round(original_size[1] * scale))),
+    display_size = original_size
+    viewport_size = (
+        max(1, min(display_size[0], max_width)),
+        max(1, min(display_size[1], max_height)),
     )
+    preview_image = image_rgb
 
-    if display_size != original_size:
-        preview_image = image_rgb.resize(display_size, Image.Resampling.LANCZOS)
+    navigator_max_width = max(160, as_int(params, "navigator_max_width", 320))
+    navigator_max_height = max(120, as_int(params, "navigator_max_height", 240))
+    navigator_scale = min(
+        1.0,
+        navigator_max_width / float(original_size[0]),
+        navigator_max_height / float(original_size[1]),
+    )
+    navigator_size = (
+        max(1, int(round(original_size[0] * navigator_scale))),
+        max(1, int(round(original_size[1] * navigator_scale))),
+    )
+    if navigator_size != original_size:
+        navigator_image = image_rgb.resize(navigator_size, Image.Resampling.LANCZOS)
     else:
-        preview_image = image_rgb
+        navigator_image = image_rgb
 
-    preloaded_points = parse_points_from_params(params)
+    preload_candidates: list[Path] = []
+    if existing_result_path is not None:
+        preload_candidates.append(existing_result_path)
+    preload_candidates.append(direct_output_path_for_image(image_path))
+    preloaded_config = load_scale_bar_preload(image_path, original_size, preload_candidates)
 
-    known_length_default = as_float(params, "known_length", 1.0)
-    if known_length_default <= 0:
-        known_length_default = 1.0
-    unit_default = as_str(params, "length_unit", "mm").strip() or "mm"
+    if preloaded_config is not None:
+        preloaded_points = (preloaded_config[0], preloaded_config[1])
+        known_length_default = preloaded_config[2]
+        unit_default = preloaded_config[3]
+    else:
+        preloaded_points = parse_points_from_params(params)
+        known_length_default = as_float(params, "known_length", 1.0)
+        if known_length_default <= 0:
+            known_length_default = 1.0
+        unit_default = as_str(params, "length_unit", "mm").strip() or "mm"
 
     class ScaleBarWindow:
         def __init__(self) -> None:
             self.root = tk.Tk()
             self.root.title("Scale Bar Config")
             self.root.geometry("1700x980")
+            self.root.after(50, self.open_full_screen)
             self.root.after(100, lambda: bring_tk_window_to_front(self.root))
             self.result: dict[str, Any] | None = None
             self.points: list[tuple[float, float]] = []
@@ -474,9 +566,24 @@ def launch_gui(initial_source_input: Path | None, params: dict[str, Any]) -> dic
                 ).pack(anchor="w", pady=(0, 6))
             ttk.Label(
                 controls,
-                text="Click two points on the preview. The third click starts a new pair.",
+                text="Click two points on the 1:1 image. Use the scrollbars or overview box to pan.",
                 wraplength=340,
             ).pack(anchor="w", pady=(0, 10))
+
+            ttk.Label(controls, text="Overview").pack(anchor="w", pady=(0, 4))
+            self.navigator_photo = ImageTk.PhotoImage(navigator_image)
+            self.navigator_canvas = tk.Canvas(
+                controls,
+                width=navigator_size[0],
+                height=navigator_size[1],
+                background="#101010",
+                highlightthickness=1,
+                highlightbackground="#707070",
+            )
+            self.navigator_canvas.pack(anchor="w", pady=(0, 12))
+            self.navigator_canvas.create_image(0, 0, anchor="nw", image=self.navigator_photo)
+            self.navigator_canvas.bind("<Button-1>", self.on_navigator_focus)
+            self.navigator_canvas.bind("<B1-Motion>", self.on_navigator_focus)
 
             ttk.Label(controls, text="Known Length").pack(anchor="w")
             ttk.Entry(controls, textvariable=self.known_length_var, width=24).pack(anchor="w", pady=(2, 8))
@@ -493,28 +600,215 @@ def launch_gui(initial_source_input: Path | None, params: dict[str, Any]) -> dic
             ttk.Button(button_row, text="Accept", command=self.accept).pack(side="left", padx=(8, 0))
             ttk.Button(button_row, text="Cancel", command=self.cancel).pack(side="left", padx=(8, 0))
 
+            ttk.Label(preview, text="Image (1:1)").pack(anchor="w")
             self.photo = ImageTk.PhotoImage(preview_image)
+            canvas_box = ttk.Frame(preview)
+            canvas_box.pack(fill="both", expand=True, pady=(4, 0))
+            canvas_box.rowconfigure(0, weight=1)
+            canvas_box.columnconfigure(0, weight=1)
+
             self.canvas = tk.Canvas(
-                preview,
-                width=display_size[0],
-                height=display_size[1],
+                canvas_box,
+                width=viewport_size[0],
+                height=viewport_size[1],
                 background="#101010",
-                highlightthickness=0,
+                highlightthickness=1,
+                highlightbackground="#707070",
+                scrollregion=(0, 0, display_size[0], display_size[1]),
             )
-            self.canvas.pack(fill="both", expand=True)
+            self.canvas.grid(row=0, column=0, sticky="nsew")
+            self.y_scrollbar = ttk.Scrollbar(canvas_box, orient="vertical", command=self._canvas_yview)
+            self.y_scrollbar.grid(row=0, column=1, sticky="ns")
+            self.x_scrollbar = ttk.Scrollbar(canvas_box, orient="horizontal", command=self._canvas_xview)
+            self.x_scrollbar.grid(row=1, column=0, sticky="ew")
+            self.canvas.configure(
+                xscrollcommand=self._on_canvas_xscroll,
+                yscrollcommand=self._on_canvas_yscroll,
+            )
             self.canvas_image_id = self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
             self.canvas.bind("<Button-1>", self.on_click)
+            self.canvas.bind("<Button-3>", self.reset_points_from_event)
+            self.canvas.bind("<Configure>", lambda _event: self._redraw_navigator_viewport())
+            self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
+            self.canvas.bind("<Shift-MouseWheel>", self.on_shift_mouse_wheel)
+            self.canvas.bind("<Button-4>", self.on_mouse_wheel)
+            self.canvas.bind("<Button-5>", self.on_mouse_wheel)
 
             if preloaded_points is not None:
                 self.points = [(float(preloaded_points[0][0]), float(preloaded_points[0][1])), (float(preloaded_points[1][0]), float(preloaded_points[1][1]))]
 
             self.redraw()
+            self.root.after(150, self.center_initial_view)
+
+        def open_full_screen(self) -> None:
+            try:
+                self.root.state("zoomed")
+                return
+            except Exception:
+                pass
+
+            try:
+                self.root.attributes("-zoomed", True)
+                return
+            except Exception:
+                pass
+
+            width = self.root.winfo_screenwidth()
+            height = self.root.winfo_screenheight()
+            self.root.geometry(f"{width}x{height}+0+0")
+
+        @staticmethod
+        def _clamp(value: float, lower: float, upper: float) -> float:
+            return max(lower, min(upper, value))
 
         def _to_canvas_xy(self, point: tuple[float, float]) -> tuple[float, float]:
-            return point[0] * scale, point[1] * scale
+            return point[0], point[1]
 
-        def _to_image_xy(self, x: float, y: float) -> tuple[float, float]:
-            return x / scale, y / scale
+        def _to_navigator_xy(self, point: tuple[float, float]) -> tuple[float, float]:
+            return point[0] * navigator_scale, point[1] * navigator_scale
+
+        def _on_canvas_xscroll(self, first: str, last: str) -> None:
+            self.x_scrollbar.set(first, last)
+            self.root.after_idle(self._redraw_navigator_viewport)
+
+        def _on_canvas_yscroll(self, first: str, last: str) -> None:
+            self.y_scrollbar.set(first, last)
+            self.root.after_idle(self._redraw_navigator_viewport)
+
+        def _canvas_xview(self, *args: Any) -> None:
+            self.canvas.xview(*args)
+            self.root.after_idle(self._redraw_navigator_viewport)
+
+        def _canvas_yview(self, *args: Any) -> None:
+            self.canvas.yview(*args)
+            self.root.after_idle(self._redraw_navigator_viewport)
+
+        def _redraw_navigator_marks(self) -> None:
+            self.navigator_canvas.delete("navigator_marks")
+            if len(self.points) == 2:
+                p0x, p0y = self._to_navigator_xy(self.points[0])
+                p1x, p1y = self._to_navigator_xy(self.points[1])
+                self.navigator_canvas.create_line(
+                    p0x,
+                    p0y,
+                    p1x,
+                    p1y,
+                    fill="#ffd166",
+                    width=2,
+                    tags="navigator_marks",
+                )
+
+            for index, point in enumerate(self.points):
+                cx, cy = self._to_navigator_xy(point)
+                radius = 3
+                color = "#50e3c2" if index == 0 else "#ff8c42"
+                self.navigator_canvas.create_oval(
+                    cx - radius,
+                    cy - radius,
+                    cx + radius,
+                    cy + radius,
+                    outline=color,
+                    width=2,
+                    tags="navigator_marks",
+                )
+
+        def _redraw_navigator_viewport(self) -> None:
+            if not hasattr(self, "navigator_canvas") or not hasattr(self, "canvas"):
+                return
+
+            self.navigator_canvas.delete("navigator_viewport")
+            canvas_w = max(self.canvas.winfo_width(), 1)
+            canvas_h = max(self.canvas.winfo_height(), 1)
+            left = self._clamp(float(self.canvas.canvasx(0)), 0.0, float(display_size[0]))
+            top = self._clamp(float(self.canvas.canvasy(0)), 0.0, float(display_size[1]))
+            right = self._clamp(float(self.canvas.canvasx(canvas_w)), 0.0, float(display_size[0]))
+            bottom = self._clamp(float(self.canvas.canvasy(canvas_h)), 0.0, float(display_size[1]))
+
+            x0 = self._clamp(left * navigator_scale, 0.0, float(navigator_size[0] - 1))
+            y0 = self._clamp(top * navigator_scale, 0.0, float(navigator_size[1] - 1))
+            x1 = self._clamp(right * navigator_scale, 0.0, float(navigator_size[0] - 1))
+            y1 = self._clamp(bottom * navigator_scale, 0.0, float(navigator_size[1] - 1))
+            rect_x1 = self._clamp(max(x0 + 1.0, x1), 0.0, float(navigator_size[0] - 1))
+            rect_y1 = self._clamp(max(y0 + 1.0, y1), 0.0, float(navigator_size[1] - 1))
+            self.navigator_canvas.create_rectangle(
+                x0,
+                y0,
+                rect_x1,
+                rect_y1,
+                outline="#ff0000",
+                width=2,
+                tags="navigator_viewport",
+            )
+
+        def _center_canvas_on_image_point(self, x: float, y: float) -> None:
+            canvas_w = max(self.canvas.winfo_width(), 1)
+            canvas_h = max(self.canvas.winfo_height(), 1)
+            max_left = max(0.0, float(display_size[0] - canvas_w))
+            max_top = max(0.0, float(display_size[1] - canvas_h))
+            left = self._clamp(x - canvas_w / 2.0, 0.0, max_left)
+            top = self._clamp(y - canvas_h / 2.0, 0.0, max_top)
+
+            if display_size[0] > canvas_w:
+                self.canvas.xview_moveto(left / float(display_size[0]))
+            else:
+                self.canvas.xview_moveto(0.0)
+            if display_size[1] > canvas_h:
+                self.canvas.yview_moveto(top / float(display_size[1]))
+            else:
+                self.canvas.yview_moveto(0.0)
+            self._redraw_navigator_viewport()
+
+        def center_on_points(self) -> None:
+            if not self.points:
+                return
+            x = sum(point[0] for point in self.points) / float(len(self.points))
+            y = sum(point[1] for point in self.points) / float(len(self.points))
+            self._center_canvas_on_image_point(x, y)
+
+        def center_on_image_middle(self) -> None:
+            self._center_canvas_on_image_point(display_size[0] / 2.0, display_size[1] / 2.0)
+
+        def center_initial_view(self) -> None:
+            if self.points:
+                self.center_on_points()
+            else:
+                self.center_on_image_middle()
+
+        def on_navigator_focus(self, event: Any) -> str:
+            nav_x = self._clamp(float(event.x), 0.0, float(navigator_size[0]))
+            nav_y = self._clamp(float(event.y), 0.0, float(navigator_size[1]))
+            self._center_canvas_on_image_point(nav_x / navigator_scale, nav_y / navigator_scale)
+            return "break"
+
+        def on_mouse_wheel(self, event: Any) -> str:
+            units = self._wheel_units(event)
+            if units:
+                self.canvas.yview_scroll(units, "units")
+                self._redraw_navigator_viewport()
+            return "break"
+
+        def on_shift_mouse_wheel(self, event: Any) -> str:
+            units = self._wheel_units(event)
+            if units:
+                self.canvas.xview_scroll(units, "units")
+                self._redraw_navigator_viewport()
+            return "break"
+
+        @staticmethod
+        def _wheel_units(event: Any) -> int:
+            event_num = getattr(event, "num", None)
+            if event_num == 4:
+                return -3
+            if event_num == 5:
+                return 3
+
+            delta = int(getattr(event, "delta", 0))
+            if delta == 0:
+                return 0
+            units = -int(delta / 120)
+            if units == 0:
+                units = -1 if delta > 0 else 1
+            return units
 
         def redraw(self) -> None:
             self.canvas.delete("scale_overlay")
@@ -562,6 +856,9 @@ def launch_gui(initial_source_input: Path | None, params: dict[str, Any]) -> dic
                 self.distance_var.set("Pixel distance: not set")
                 self.scale_var.set("Scale: not set")
 
+            self._redraw_navigator_marks()
+            self._redraw_navigator_viewport()
+
         def _known_length_or_none(self) -> float | None:
             try:
                 value = float(self.known_length_var.get())
@@ -572,12 +869,12 @@ def launch_gui(initial_source_input: Path | None, params: dict[str, Any]) -> dic
             return value
 
         def on_click(self, event: Any) -> None:
-            x = float(event.x)
-            y = float(event.y)
-            if x < 0 or y < 0 or x > display_size[0] or y > display_size[1]:
+            x = float(self.canvas.canvasx(event.x))
+            y = float(self.canvas.canvasy(event.y))
+            if x < 0 or y < 0 or x >= display_size[0] or y >= display_size[1]:
                 return
 
-            point = self._to_image_xy(x, y)
+            point = (x, y)
             if len(self.points) >= 2:
                 self.points = [point]
             else:
@@ -587,6 +884,10 @@ def launch_gui(initial_source_input: Path | None, params: dict[str, Any]) -> dic
         def reset_points(self) -> None:
             self.points = []
             self.redraw()
+
+        def reset_points_from_event(self, _event: Any) -> str:
+            self.reset_points()
+            return "break"
 
         def accept(self) -> None:
             if len(self.points) != 2:
@@ -627,11 +928,11 @@ def launch_gui(initial_source_input: Path | None, params: dict[str, Any]) -> dic
     return window.run()
 
 
-def run_stage_for_runner(source_input: Path, params: dict[str, Any]) -> dict[str, Any]:
+def run_stage_for_runner(source_input: Path, params: dict[str, Any], output_result_json: Path | None = None) -> dict[str, Any]:
     run_mode = resolve_run_mode()
     open_results = as_bool(params, "open_results", False)
     if run_mode == "visual" or open_results:
-        payload = launch_gui(source_input, params)
+        payload = launch_gui(source_input, params, output_result_json)
         payload["action"] = "open_results"
         payload["run_mode"] = run_mode
         payload["open_results"] = open_results
@@ -685,12 +986,13 @@ def main() -> int:
         gui_source = Path(gui_source_raw).expanduser().resolve() if has_text(gui_source_raw) else None
         gui_params_raw = args.gui_params_json or args.params_json or ""
         gui_params = load_json_object_optional(gui_params_raw)
-        payload = launch_gui(gui_source, gui_params)
-        output_result_json = (
+        explicit_output_result_json = (
             Path(str(args.output_result_json)).expanduser().resolve()
             if has_output
-            else direct_output_path_for_payload(payload)
+            else None
         )
+        payload = launch_gui(gui_source, gui_params, explicit_output_result_json)
+        output_result_json = explicit_output_result_json or direct_output_path_for_payload(payload)
         payload["output_result_json"] = str(output_result_json)
         write_result_json(output_result_json, payload)
         print(f"Wrote result JSON: {output_result_json}", flush=True)
@@ -706,7 +1008,7 @@ def main() -> int:
         params_path = Path(str(args.params_json)).expanduser().resolve()
         params = load_json_object(params_path)
 
-        payload = run_stage_for_runner(source_input, params)
+        payload = run_stage_for_runner(source_input, params, output_result_json)
         payload.setdefault("source_exists", source_input.exists())
 
         write_result_json(output_result_json, payload)
