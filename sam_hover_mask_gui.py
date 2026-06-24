@@ -409,12 +409,14 @@ class SamHoverMaskApp:
         self.pos_points: list[tuple[float, float]] = []
         self.neg_points: list[tuple[float, float]] = []
         self.hover_point: tuple[float, float] | None = None
+        self._hover_preview_mask: np.ndarray | None = None
 
         self.last_mask: np.ndarray | None = None
         self.committed_masks: list[np.ndarray] = []
         self._seed_mask_cache: dict[tuple[int, int], np.ndarray] = {}
         self._active_session_id = 0
         self._auto_advance_session_id: int | None = None
+        self._pending_navigation_delta: int | None = None
         self._session_to_mask_index: dict[int, int] = {}
         self._session_metadata: dict[int, dict[str, Any]] = {}
         self._predict_lock = threading.Lock()
@@ -730,6 +732,11 @@ class SamHoverMaskApp:
         self._load_image_from_path(Path(path))
 
     def _load_image_from_path(self, image_path: Path) -> bool:
+        if self._predict_busy or (self._dirty_preview and bool(self.pos_points)):
+            self.status_var.set("Finishing current mask before loading another image.")
+            return False
+        self._cancel_preview_for_image_transition()
+
         try:
             image_path = image_path.resolve()
             img = Image.open(image_path).convert("RGB")
@@ -815,22 +822,44 @@ class SamHoverMaskApp:
                 state=(tk.DISABLED if self._batch_cache_busy else tk.NORMAL)
             )
 
+    def _cancel_preview_for_image_transition(self) -> None:
+        self._dirty_preview = False
+        self._request_id += 1
+        self._seed_mask_cache.clear()
+        self.hover_point = None
+        self._hover_preview_mask = None
+        self.last_mask = None
+
+    def _defer_navigation_if_prediction_active(self, delta: int) -> bool:
+        if self._predict_busy or (self._dirty_preview and bool(self.pos_points)):
+            self._pending_navigation_delta = int(delta)
+            self.status_var.set("Finishing current mask before changing images...")
+            if self._dirty_preview and not self._predict_busy:
+                self._run_preview()
+            return True
+        if self._dirty_preview:
+            self._cancel_preview_for_image_transition()
+        return False
+
+    def _consume_pending_navigation(self) -> None:
+        delta = self._pending_navigation_delta
+        self._pending_navigation_delta = None
+        if delta is None:
+            return
+        self._cancel_preview_for_image_transition()
+        self._navigate_image_delta(int(delta))
+
     def _navigate_prev_image(self) -> None:
-        if self.image_path is not None and not self._folder_image_paths:
-            self._refresh_folder_image_list(self.image_path.parent, self.image_path)
-        if not self._folder_image_paths:
-            self.status_var.set("No image folder list available. Load an image first.")
-            return
-        if self.image_path is None:
-            self._load_image_from_path(self._folder_image_paths[0])
-            return
-        if self._current_image_index <= 0:
-            self.status_var.set("Already at first image in folder.")
-            return
-        next_path = self._folder_image_paths[self._current_image_index - 1]
-        self._load_image_from_path(next_path)
+        self._navigate_image_delta(-1)
 
     def _navigate_next_image(self) -> None:
+        self._navigate_image_delta(1)
+
+    def _navigate_image_delta(self, delta: int) -> None:
+        if delta == 0:
+            return
+        if self._defer_navigation_if_prediction_active(delta):
+            return
         if self.image_path is not None and not self._folder_image_paths:
             self._refresh_folder_image_list(self.image_path.parent, self.image_path)
         if not self._folder_image_paths:
@@ -839,10 +868,20 @@ class SamHoverMaskApp:
         if self.image_path is None:
             self._load_image_from_path(self._folder_image_paths[0])
             return
-        if self._current_image_index < 0 or self._current_image_index >= len(self._folder_image_paths) - 1:
-            self.status_var.set("Already at last image in folder.")
-            return
-        next_path = self._folder_image_paths[self._current_image_index + 1]
+
+        if delta < 0:
+            if self._current_image_index <= 0:
+                self.status_var.set("Already at first image in folder.")
+                return
+            next_path = self._folder_image_paths[self._current_image_index - 1]
+        else:
+            if (
+                self._current_image_index < 0
+                or self._current_image_index >= len(self._folder_image_paths) - 1
+            ):
+                self.status_var.set("Already at last image in folder.")
+                return
+            next_path = self._folder_image_paths[self._current_image_index + 1]
         self._load_image_from_path(next_path)
 
     def _cache_folder_all(self) -> None:
@@ -1416,6 +1455,7 @@ class SamHoverMaskApp:
         self.neg_points.clear()
         self._seed_mask_cache.clear()
         self.hover_point = None
+        self._hover_preview_mask = None
         self._auto_advance_session_id = None
         self.committed_masks.clear()
         self._session_to_mask_index.clear()
@@ -1501,6 +1541,7 @@ class SamHoverMaskApp:
         self.pos_points[:] = [p]
         self.neg_points.clear()
         self._seed_mask_cache.clear()
+        self._hover_preview_mask = None
         self.hover_point = p
         self._schedule_preview()
 
@@ -1512,6 +1553,7 @@ class SamHoverMaskApp:
         self.neg_points.clear()
         self._seed_mask_cache.clear()
         self.hover_point = None
+        self._hover_preview_mask = None
         self.last_mask = None
         self._render()
 
@@ -1542,8 +1584,11 @@ class SamHoverMaskApp:
             )
         if removed_masks > 0:
             annotations_changed = True
+            self.last_mask = None
+            self._hover_preview_mask = None
 
         if removed_points > 0:
+            self._hover_preview_mask = None
             self._seed_mask_cache.clear()
             session_id = int(self._active_session_id)
             if not self.pos_points and session_id > 0:
@@ -1656,20 +1701,30 @@ class SamHoverMaskApp:
     def _on_mouse_move(self, event: tk.Event) -> None:
         p = self._to_image_coords(event.x, event.y)
         if p is None:
+            if self.hover_point is not None or self._hover_preview_mask is not None:
+                self.hover_point = None
+                self._hover_preview_mask = None
+                self._render()
             return
         self.hover_point = p
+        self._hover_preview_mask = None
         self._schedule_preview()
 
     def _on_mouse_leave(self, _event: tk.Event) -> None:
         self.hover_point = None
+        self._hover_preview_mask = None
         self._render()
 
     def _clear_prompts(self, reset_mask: bool = True, persist: bool = True) -> None:
+        self._dirty_preview = False
+        self._request_id += 1
+        self._pending_navigation_delta = None
         self.pos_points.clear()
         self.neg_points.clear()
         self._seed_mask_cache.clear()
         self._auto_advance_session_id = None
         self.hover_point = None
+        self._hover_preview_mask = None
         if reset_mask:
             self.last_mask = None
             self.committed_masks.clear()
@@ -1713,6 +1768,7 @@ class SamHoverMaskApp:
 
         if not pos:
             self.last_mask = None
+            self._hover_preview_mask = None
             self._seed_mask_cache.clear()
             session_id = int(self._active_session_id)
             if session_id > 0:
@@ -1875,26 +1931,38 @@ class SamHoverMaskApp:
             self.status_var.set(f"Prediction warning: {err}")
             if self._auto_advance_session_id == int(session_id):
                 self._auto_advance_session_id = None
+            if is_hover_preview:
+                self._hover_preview_mask = None
         else:
-            self.last_mask = mask
-            if mask is not None and session_id > 0:
-                existing = self._session_to_mask_index.get(session_id)
-                if existing is None:
-                    self.committed_masks.append(mask.copy())
-                    self._session_to_mask_index[session_id] = len(self.committed_masks) - 1
-                else:
-                    self.committed_masks[existing] = mask.copy()
-                if not is_hover_preview:
+            if is_hover_preview:
+                self.last_mask = None
+                self._hover_preview_mask = mask.copy() if mask is not None else None
+            else:
+                self._hover_preview_mask = None
+                self.last_mask = mask
+                if mask is not None and session_id > 0:
+                    existing = self._session_to_mask_index.get(session_id)
+                    if existing is None:
+                        self.committed_masks.append(mask.copy())
+                        self._session_to_mask_index[session_id] = len(self.committed_masks) - 1
+                    else:
+                        self.committed_masks[existing] = mask.copy()
                     self._update_session_metadata_with_mask(session_id=session_id, mask=mask)
                     self._save_annotations_for_current_image()
-                should_auto_advance = self._auto_advance_session_id == int(session_id)
-            elif self._auto_advance_session_id == int(session_id):
-                self._auto_advance_session_id = None
+                    should_auto_advance = self._auto_advance_session_id == int(session_id)
+                elif self._auto_advance_session_id == int(session_id):
+                    self._auto_advance_session_id = None
         if should_auto_advance:
             self._start_new_mask_session()
-        else:
+        elif self._pending_navigation_delta is None:
             self._render()
-        if self._dirty_preview:
+
+        if self._pending_navigation_delta is not None:
+            self._dirty_preview = False
+            self.hover_point = None
+            self._hover_preview_mask = None
+            self.root.after(0, self._consume_pending_navigation)
+        elif self._dirty_preview:
             self.root.after(8, self._run_preview)
 
     def _remove_committed_mask_for_session(self, session_id: int) -> None:
@@ -1966,6 +2034,9 @@ class SamHoverMaskApp:
             combined_mask = cur if combined_mask is None else (combined_mask | cur)
         if combined_mask is None and self.last_mask is not None:
             combined_mask = np.asarray(self.last_mask > threshold)
+        if self._hover_preview_mask is not None:
+            hover_mask = np.asarray(self._hover_preview_mask > threshold)
+            combined_mask = hover_mask if combined_mask is None else (combined_mask | hover_mask)
 
         if combined_mask is not None:
             mask_img = Image.fromarray((combined_mask.astype(np.uint8) * 255), mode="L")
