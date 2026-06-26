@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 from PIL import Image, ImageTk
+import sam_mask_engine as mask_engine
 from model_downloader import (
     DEFAULT_MODEL_NAME,
     available_model_names,
@@ -159,7 +160,14 @@ def resolve_preload_source_input(params: dict[str, Any]) -> Path | None:
     return None
 
 
-def build_model_cache_token(
+def _path_size_for_cache_token(path: Path) -> str:
+    try:
+        return str(int(path.stat().st_size))
+    except Exception:
+        return "unknown"
+
+
+def build_legacy_model_cache_token(
     model_name: str,
     encoder_path: Path,
     decoder_path: Path,
@@ -175,9 +183,136 @@ def build_model_cache_token(
     )
 
 
+def build_model_cache_token(
+    model_name: str,
+    encoder_path: Path,
+    decoder_path: Path,
+    image_size: int,
+) -> str:
+    encoder = Path(encoder_path)
+    decoder = Path(decoder_path)
+    return "|".join(
+        [
+            "sam_embedding_cache_v2",
+            str(model_name).strip() or DEFAULT_MODEL_NAME,
+            encoder.name,
+            _path_size_for_cache_token(encoder),
+            decoder.name,
+            _path_size_for_cache_token(decoder),
+            str(int(image_size)),
+        ]
+    )
+
+
+def build_model_cache_metadata(
+    model_name: str,
+    encoder_path: Path,
+    decoder_path: Path,
+    image_size: int,
+) -> dict[str, Any]:
+    encoder = Path(encoder_path)
+    decoder = Path(decoder_path)
+    return {
+        "model_cache_token_version": 2,
+        "model_name": str(model_name).strip() or DEFAULT_MODEL_NAME,
+        "model_image_size": int(image_size),
+        "encoder_name": encoder.name,
+        "decoder_name": decoder.name,
+        "encoder_size_bytes": _path_size_for_cache_token(encoder),
+        "decoder_size_bytes": _path_size_for_cache_token(decoder),
+        "legacy_model_cache_token": build_legacy_model_cache_token(
+            model_name=model_name,
+            encoder_path=encoder,
+            decoder_path=decoder,
+            image_size=image_size,
+        ),
+    }
+
+
 def embedding_store_path_for_image(image_path: Path, model_cache_token: str) -> Path:
     token_hash = hashlib.sha1(model_cache_token.encode("utf-8")).hexdigest()[:12]
     return image_path.with_name(f"{image_path.name}.{token_hash}{EMBEDDING_FILE_SUFFIX}")
+
+
+def embedding_cache_candidate_paths_for_image(
+    image_path: Path,
+    model_cache_token: str,
+) -> list[Path]:
+    exact_path = embedding_store_path_for_image(image_path, model_cache_token)
+    prefix = f"{image_path.name}."
+    candidates: list[Path] = [exact_path]
+    try:
+        for sibling in sorted(image_path.parent.iterdir(), key=lambda path: path.name.lower()):
+            if (
+                sibling.is_file()
+                and sibling.name.startswith(prefix)
+                and sibling.name.endswith(EMBEDDING_FILE_SUFFIX)
+            ):
+                candidates.append(sibling)
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def embedding_cache_payload_matches_image(
+    payload: dict[str, Any],
+    image_path: Path,
+    image_shape_hw: tuple[int, int] | None = None,
+) -> bool:
+    image_hw = payload.get("image_size_hw")
+    if image_shape_hw is not None:
+        if not (isinstance(image_hw, list) and len(image_hw) == 2):
+            return False
+        if (int(image_hw[0]), int(image_hw[1])) != image_shape_hw:
+            return False
+
+    cached_size = payload.get("image_file_size_bytes")
+    if cached_size is not None:
+        try:
+            if int(cached_size) != int(image_path.stat().st_size):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def embedding_cache_payload_matches_model(
+    payload: dict[str, Any],
+    model_cache_token: str,
+    model_metadata: dict[str, Any],
+    allow_legacy_unknown_token: bool = False,
+) -> bool:
+    if payload.get("model_cache_token") == model_cache_token:
+        return True
+
+    comparable_keys = (
+        "model_name",
+        "model_image_size",
+        "encoder_name",
+        "decoder_name",
+        "encoder_size_bytes",
+        "decoder_size_bytes",
+    )
+    if all(key in payload for key in comparable_keys):
+        try:
+            return all(
+                str(payload.get(key)) == str(model_metadata.get(key))
+                for key in comparable_keys
+            )
+        except Exception:
+            return False
+
+    return bool(
+        allow_legacy_unknown_token and isinstance(payload.get("model_cache_token"), str)
+    )
 
 
 def annotation_store_path_for_image(image_path: Path) -> Path:
@@ -193,6 +328,7 @@ def save_embedding_cache_for_image(
     image_np: np.ndarray,
     embedding: np.ndarray,
     model_cache_token: str,
+    model_metadata: dict[str, Any] | None = None,
 ) -> Path:
     cache_path = embedding_store_path_for_image(
         image_path=image_path,
@@ -221,6 +357,7 @@ def save_embedding_cache_for_image(
         "image_file_size_bytes": image_file_size,
         "image_mtime_ns": image_mtime_ns,
     }
+    payload.update(dict(model_metadata or {}))
 
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1102,6 +1239,7 @@ class SamHoverMaskApp:
         encoder = Path(self.encoder_var.get().strip())
         decoder = Path(self.decoder_var.get().strip())
         model_cache_token = self._model_cache_token()
+        model_cache_metadata = self._model_cache_metadata()
         model_image_size = int(self.model.image_size) if self.model is not None else 1024
         total = len(candidates)
 
@@ -1132,7 +1270,11 @@ class SamHoverMaskApp:
 
             for idx, path in enumerate(candidates, start=1):
                 try:
-                    if self._is_embedding_cache_fresh_for_image(path, model_cache_token):
+                    if self._is_embedding_cache_fresh_for_image(
+                        path,
+                        model_cache_token,
+                        model_cache_metadata=model_cache_metadata,
+                    ):
                         skipped += 1
                     else:
                         image_np = np.asarray(Image.open(path).convert("RGB"))
@@ -1145,6 +1287,7 @@ class SamHoverMaskApp:
                             image_np=image_np,
                             embedding=embedding,
                             model_cache_token=model_cache_token,
+                            model_metadata=model_cache_metadata,
                         ):
                             cached += 1
                         else:
@@ -1207,9 +1350,31 @@ class SamHoverMaskApp:
 
     def _model_cache_token(self) -> str:
         model_name = self.model_name_var.get().strip() or DEFAULT_MODEL_NAME
-        encoder, decoder = self._loaded_model_signature or ("", "")
+        encoder, decoder = self._loaded_model_signature or (
+            self.encoder_var.get().strip(),
+            self.decoder_var.get().strip(),
+        )
         image_size = int(self.model.image_size) if self.model is not None else 0
-        return "|".join([model_name, encoder, decoder, str(image_size)])
+        return build_model_cache_token(
+            model_name=model_name,
+            encoder_path=Path(encoder),
+            decoder_path=Path(decoder),
+            image_size=image_size,
+        )
+
+    def _model_cache_metadata(self) -> dict[str, Any]:
+        model_name = self.model_name_var.get().strip() or DEFAULT_MODEL_NAME
+        encoder, decoder = self._loaded_model_signature or (
+            self.encoder_var.get().strip(),
+            self.decoder_var.get().strip(),
+        )
+        image_size = int(self.model.image_size) if self.model is not None else 0
+        return build_model_cache_metadata(
+            model_name=model_name,
+            encoder_path=Path(encoder),
+            decoder_path=Path(decoder),
+            image_size=image_size,
+        )
 
     def _embedding_store_path_for_image(
         self, image_path: Path, model_cache_token: str | None = None
@@ -1245,6 +1410,7 @@ class SamHoverMaskApp:
         image_np: np.ndarray,
         embedding: np.ndarray,
         model_cache_token: str,
+        model_metadata: dict[str, Any] | None = None,
     ) -> bool:
         cache_path = self._embedding_store_path_for_image(
             image_path=image_path,
@@ -1271,6 +1437,7 @@ class SamHoverMaskApp:
             "image_file_size_bytes": image_file_size,
             "image_mtime_ns": image_mtime_ns,
         }
+        payload.update(dict(model_metadata or {}))
 
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1287,49 +1454,50 @@ class SamHoverMaskApp:
             return False
 
     def _is_embedding_cache_fresh_for_image(
-        self, image_path: Path, model_cache_token: str
+        self,
+        image_path: Path,
+        model_cache_token: str,
+        model_cache_metadata: dict[str, Any] | None = None,
     ) -> bool:
-        cache_path = self._embedding_store_path_for_image(
-            image_path=image_path,
-            model_cache_token=model_cache_token,
-        )
-        if not cache_path.exists():
-            return False
-        try:
-            with np.load(cache_path, allow_pickle=False) as data:
-                metadata_json = (
-                    data["metadata_json"] if "metadata_json" in data.files else None
-                )
-        except Exception:
-            return False
-        if metadata_json is None:
-            return False
+        candidates = [path for path in embedding_cache_candidate_paths_for_image(
+            image_path,
+            model_cache_token,
+        ) if path.exists()]
+        model_metadata = dict(model_cache_metadata or self._model_cache_metadata())
+        allow_unknown_legacy = len(candidates) == 1
+        for cache_path in candidates:
+            try:
+                with np.load(cache_path, allow_pickle=False) as data:
+                    metadata_json = (
+                        data["metadata_json"] if "metadata_json" in data.files else None
+                    )
+            except Exception:
+                continue
+            if metadata_json is None:
+                continue
 
-        try:
-            if np.ndim(metadata_json) == 0:
-                metadata_text = str(metadata_json.item())
-            else:
-                metadata_text = str(np.asarray(metadata_json).reshape(-1)[0])
-            payload = json.loads(metadata_text)
-            if not isinstance(payload, dict):
-                return False
-        except Exception:
-            return False
+            try:
+                if np.ndim(metadata_json) == 0:
+                    metadata_text = str(metadata_json.item())
+                else:
+                    metadata_text = str(np.asarray(metadata_json).reshape(-1)[0])
+                payload = json.loads(metadata_text)
+                if not isinstance(payload, dict):
+                    continue
+            except Exception:
+                continue
 
-        if payload.get("model_cache_token") != model_cache_token:
-            return False
-        try:
-            stat = image_path.stat()
-            cached_size = payload.get("image_file_size_bytes")
-            cached_mtime_ns = payload.get("image_mtime_ns")
-            if cached_size is not None and int(cached_size) != int(stat.st_size):
-                return False
-            if cached_mtime_ns is not None and int(cached_mtime_ns) != int(stat.st_mtime_ns):
-                return False
-        except Exception:
-            return False
-        return True
-
+            if not embedding_cache_payload_matches_image(payload, image_path):
+                continue
+            if not embedding_cache_payload_matches_model(
+                payload,
+                model_cache_token,
+                model_metadata,
+                allow_legacy_unknown_token=allow_unknown_legacy,
+            ):
+                continue
+            return True
+        return False
     def _save_cached_embedding_for_current_image(self) -> bool:
         if self.model is None or self.image_np is None or self.image_path is None:
             return False
@@ -1341,69 +1509,77 @@ class SamHoverMaskApp:
             image_np=self.image_np,
             embedding=embedding,
             model_cache_token=self._model_cache_token(),
+            model_metadata=self._model_cache_metadata(),
         )
 
     def _load_cached_embedding_for_current_image(self) -> bool:
-        if self.model is None or self.image_np is None:
-            return False
-        cache_path = self._embedding_store_path()
-        if cache_path is None or (not cache_path.exists()):
+        if self.model is None or self.image_np is None or self.image_path is None:
             return False
 
-        try:
-            with np.load(cache_path, allow_pickle=False) as data:
-                embedding = np.asarray(data["embedding"], dtype=np.float32)
-                metadata_json = (
-                    data["metadata_json"] if "metadata_json" in data.files else None
-                )
-        except Exception:
+        model_cache_token = self._model_cache_token()
+        model_metadata = self._model_cache_metadata()
+        expected_cache_path = self._embedding_store_path_for_image(
+            self.image_path,
+            model_cache_token=model_cache_token,
+        )
+        candidates = [path for path in embedding_cache_candidate_paths_for_image(
+            self.image_path,
+            model_cache_token,
+        ) if path.exists()]
+        if not candidates:
             return False
 
-        if embedding.ndim != 4:
-            return False
-
-        payload: dict[str, Any] = {}
-        if metadata_json is not None:
+        allow_unknown_legacy = len(candidates) == 1
+        for cache_path in candidates:
             try:
-                if np.ndim(metadata_json) == 0:
-                    metadata_text = str(metadata_json.item())
-                else:
-                    metadata_text = str(np.asarray(metadata_json).reshape(-1)[0])
-                if metadata_text:
-                    loaded_payload = json.loads(metadata_text)
-                    if isinstance(loaded_payload, dict):
-                        payload = loaded_payload
+                with np.load(cache_path, allow_pickle=False) as data:
+                    embedding = np.asarray(data["embedding"], dtype=np.float32)
+                    metadata_json = (
+                        data["metadata_json"] if "metadata_json" in data.files else None
+                    )
             except Exception:
-                payload = {}
+                continue
 
-        if payload:
-            if payload.get("model_cache_token") != self._model_cache_token():
-                return False
-            image_hw = payload.get("image_size_hw")
-            if (
-                isinstance(image_hw, list)
-                and len(image_hw) == 2
-                and (int(image_hw[0]), int(image_hw[1])) != self.image_np.shape[:2]
-            ):
-                return False
-            if self.image_path is not None:
+            if embedding.ndim != 4:
+                continue
+
+            payload: dict[str, Any] = {}
+            if metadata_json is not None:
                 try:
-                    stat = self.image_path.stat()
-                    cached_size = payload.get("image_file_size_bytes")
-                    cached_mtime_ns = payload.get("image_mtime_ns")
-                    if cached_size is not None and int(cached_size) != int(stat.st_size):
-                        return False
-                    if (
-                        cached_mtime_ns is not None
-                        and int(cached_mtime_ns) != int(stat.st_mtime_ns)
-                    ):
-                        return False
+                    if np.ndim(metadata_json) == 0:
+                        metadata_text = str(metadata_json.item())
+                    else:
+                        metadata_text = str(np.asarray(metadata_json).reshape(-1)[0])
+                    if metadata_text:
+                        loaded_payload = json.loads(metadata_text)
+                        if isinstance(loaded_payload, dict):
+                            payload = loaded_payload
                 except Exception:
-                    pass
+                    payload = {}
 
-        self.model.set_image_with_embedding(self.image_np, embedding)
-        return True
+            if not payload:
+                if cache_path != expected_cache_path:
+                    continue
+            else:
+                if not embedding_cache_payload_matches_image(
+                    payload,
+                    self.image_path,
+                    image_shape_hw=self.image_np.shape[:2],
+                ):
+                    continue
+                if not embedding_cache_payload_matches_model(
+                    payload,
+                    model_cache_token,
+                    model_metadata,
+                    allow_legacy_unknown_token=allow_unknown_legacy,
+                ):
+                    continue
 
+            self.model.set_image_with_embedding(self.image_np, embedding)
+            if cache_path != expected_cache_path:
+                self._save_cached_embedding_for_current_image()
+            return True
+        return False
     @staticmethod
     def _utc_now_iso() -> str:
         return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -1461,112 +1637,83 @@ class SamHoverMaskApp:
 
     @staticmethod
     def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        text = json.dumps(payload, indent=2, ensure_ascii=True)
-        tmp_path.write_text(text, encoding="utf-8")
-        tmp_path.replace(path)
+        mask_engine.write_json_atomic(path, payload)
 
     @staticmethod
     def _load_json_object_optional(path: Path | None) -> dict[str, Any]:
-        if path is None or (not path.exists()):
-            return {}
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception:
-            return {}
-        if isinstance(loaded, dict):
-            return loaded
-        return {}
+        return mask_engine.load_json_object_optional(path)
 
     def _sessions_by_mask_index(self) -> dict[int, int]:
-        sessions_by_index: dict[int, int] = {}
-        for sid, idx in self._session_to_mask_index.items():
-            if 0 <= int(idx) < len(self.committed_masks):
-                sessions_by_index[int(idx)] = int(sid)
-        return sessions_by_index
-
+        return mask_engine.sessions_by_mask_index(
+            self._session_to_mask_index,
+            len(self.committed_masks),
+        )
 
     def _session_metadata_for_mask_index(self, idx: int) -> dict[str, Any]:
-        sessions_by_index = self._sessions_by_mask_index()
-        sid = sessions_by_index.get(int(idx))
-        if sid is None:
-            return {}
-        return self._session_metadata.get(int(sid), {})
+        return mask_engine.session_metadata_for_mask_index(
+            idx,
+            self._session_to_mask_index,
+            self._session_metadata,
+            len(self.committed_masks),
+        )
 
     @staticmethod
     def _metadata_marks_binary_mask(md: dict[str, Any]) -> bool:
-        for key in ("mask_values_are_binary", "stored_mask_values_are_binary"):
-            parsed = parse_bool_like(md.get(key))
-            if parsed is True:
-                return True
-        kind = str(md.get("mask_values_kind", "")).strip().lower()
-        stored_kind = str(md.get("stored_mask_values_kind", "")).strip().lower()
-        return kind in {"binary", "thresholded_binary"} or stored_kind in {
-            "binary",
-            "thresholded_binary",
-        }
+        return mask_engine.metadata_marks_binary_mask(md)
 
     @staticmethod
     def _array_values_are_binary(mask: np.ndarray) -> bool:
-        arr = np.asarray(mask)
-        if arr.size == 0:
-            return False
-        return bool(np.all((arr == 0) | (arr == 1) | (arr == 255)))
+        return mask_engine.array_values_are_binary(mask)
 
     @staticmethod
     def _threshold_from_metadata(md: dict[str, Any], fallback: float) -> float:
-        if SamHoverMaskApp._metadata_marks_binary_mask(md):
-            return 0.5
-        for key in ("threshold_last_saved", "threshold_at_click"):
-            parsed = parse_float_like(md.get(key))
-            if parsed is not None:
-                return float(parsed)
-        return float(fallback)
+        return mask_engine.threshold_from_metadata(md, fallback)
 
     def _threshold_for_committed_mask(self, idx: int, fallback: float) -> float:
-        return self._threshold_from_metadata(
-            self._session_metadata_for_mask_index(idx),
+        return mask_engine.threshold_for_committed_mask(
+            idx,
             fallback,
+            self._session_to_mask_index,
+            self._session_metadata,
+            len(self.committed_masks),
         )
 
     def _threshold_for_ignore_mask(self, idx: int, fallback: float) -> float:
-        metadata = getattr(self, "_ignore_mask_metadata", [])
-        md = metadata[idx] if 0 <= int(idx) < len(metadata) else {}
-        return self._threshold_from_metadata(md, fallback)
+        return mask_engine.threshold_for_ignore_mask(
+            idx,
+            fallback,
+            getattr(self, "_ignore_mask_metadata", []),
+        )
 
     def _thresholds_for_committed_masks(self, fallback: float) -> list[float]:
-        return [
-            self._threshold_for_committed_mask(idx, fallback)
-            for idx in range(len(self.committed_masks))
-        ]
+        return mask_engine.thresholds_for_committed_masks(
+            self.committed_masks,
+            fallback,
+            self._session_to_mask_index,
+            self._session_metadata,
+        )
 
     def _thresholds_for_ignore_masks(self, fallback: float) -> list[float]:
-        return [
-            self._threshold_for_ignore_mask(idx, fallback)
-            for idx in range(len(getattr(self, "ignore_masks", [])))
-        ]
+        return mask_engine.thresholds_for_ignore_masks(
+            list(getattr(self, "ignore_masks", [])),
+            fallback,
+            list(getattr(self, "_ignore_mask_metadata", [])),
+        )
 
     def _binary_ignore_mask_at_index(self, idx: int, fallback: float) -> np.ndarray:
-        mask = np.asarray(self.ignore_masks[idx], dtype=np.float32)
-        threshold = self._threshold_for_ignore_mask(idx, fallback)
-        return np.asarray(mask > threshold)
+        return mask_engine.binary_ignore_mask_at_index(
+            list(getattr(self, "ignore_masks", [])),
+            list(getattr(self, "_ignore_mask_metadata", [])),
+            idx,
+            fallback,
+        )
 
     def _combined_ignore_mask(self, fallback: float) -> np.ndarray | None:
-        ignore_masks = getattr(self, "ignore_masks", [])
-        if not ignore_masks:
-            return None
-        combined: np.ndarray | None = None
-        for idx in range(len(ignore_masks)):
-            mask = self._binary_ignore_mask_at_index(idx, fallback)
-            if mask.ndim != 2:
-                continue
-            if combined is None:
-                combined = np.zeros(mask.shape, dtype=bool)
-            if combined.shape != mask.shape:
-                continue
-            combined |= mask
-        return combined
+        return mask_engine.combined_ignore_mask(
+            list(getattr(self, "ignore_masks", [])),
+            list(getattr(self, "_ignore_mask_metadata", [])),
+            fallback,
+        )
 
     def _binary_mask_with_ignore(
         self,
@@ -1574,83 +1721,44 @@ class SamHoverMaskApp:
         threshold: float,
         subtract_ignored: bool = True,
     ) -> np.ndarray:
-        binary = np.asarray(np.asarray(mask, dtype=np.float32) > float(threshold))
-        if subtract_ignored:
-            ignore_mask = self._combined_ignore_mask(float(threshold))
-            if ignore_mask is not None and ignore_mask.shape == binary.shape:
-                binary = binary & (~ignore_mask)
-        return binary
+        return mask_engine.binary_mask_with_ignore(
+            mask,
+            threshold,
+            ignore_masks=list(getattr(self, "ignore_masks", [])),
+            ignore_mask_metadata=list(getattr(self, "_ignore_mask_metadata", [])),
+            subtract_ignored=subtract_ignored,
+        )
 
     def _binary_committed_mask_at_index(self, idx: int, fallback: float) -> np.ndarray:
-        mask = np.asarray(self.committed_masks[idx], dtype=np.float32)
-        threshold = self._threshold_for_committed_mask(idx, fallback)
-        return self._binary_mask_with_ignore(mask, threshold, subtract_ignored=True)
+        return mask_engine.binary_committed_mask_at_index(
+            self.committed_masks,
+            idx,
+            fallback,
+            self._session_to_mask_index,
+            self._session_metadata,
+            ignore_masks=list(getattr(self, "ignore_masks", [])),
+            ignore_mask_metadata=list(getattr(self, "_ignore_mask_metadata", [])),
+        )
 
     @staticmethod
     def _mask_area_and_bbox(binary: np.ndarray) -> tuple[int, list[int] | None]:
-        mask = np.asarray(binary, dtype=bool)
-        area_px = int(np.count_nonzero(mask))
-        if area_px <= 0:
-            return 0, None
-        ys, xs = np.nonzero(mask)
-        return area_px, [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+        return mask_engine.mask_area_and_bbox(binary)
 
     def _build_annotation_payload(self, saved_at: str) -> dict[str, Any]:
         h, w = self.image_np.shape[:2]
-        sessions_by_index = self._sessions_by_mask_index()
-        threshold_for_export = float(self.mask_threshold_var.get())
-
-        records: list[dict[str, Any]] = []
-        total_mask_area_px = 0
-        for idx in range(len(self.committed_masks)):
-            sid = int(sessions_by_index.get(idx, idx + 1))
-            md = dict(self._session_metadata.get(sid, {}))
-            md["session_id"] = sid
-            md["mask_index"] = int(idx)
-            md["last_updated_utc"] = md.get("last_updated_utc", saved_at)
-            binary = self._binary_committed_mask_at_index(idx, threshold_for_export)
-            area_px, bbox_xyxy = self._mask_area_and_bbox(binary)
-            total_mask_area_px += int(area_px)
-            md["mask_area_px"] = int(area_px)
-            md["mask_bbox_xyxy"] = bbox_xyxy
-            md["stored_mask_values_are_binary"] = True
-            md["stored_mask_values_kind"] = "thresholded_binary"
-            md["ignore_regions_applied"] = int(len(getattr(self, "ignore_masks", [])))
-            records.append(md)
-
-        ignore_records: list[dict[str, Any]] = []
-        ignore_total_mask_area_px = 0
-        for idx in range(len(getattr(self, "ignore_masks", []))):
-            md = dict(self._ignore_mask_metadata[idx]) if idx < len(self._ignore_mask_metadata) else {}
-            md["ignore_index"] = int(idx)
-            md["last_updated_utc"] = md.get("last_updated_utc", saved_at)
-            binary = self._binary_ignore_mask_at_index(idx, threshold_for_export)
-            area_px, bbox_xyxy = self._mask_area_and_bbox(binary)
-            ignore_total_mask_area_px += int(area_px)
-            md["mask_area_px"] = int(area_px)
-            md["mask_bbox_xyxy"] = bbox_xyxy
-            md["stored_mask_values_are_binary"] = True
-            md["stored_mask_values_kind"] = "thresholded_binary"
-            ignore_records.append(md)
-
-        payload: dict[str, Any] = {
-            "version": 1,
-            "image_path": str(self.image_path) if self.image_path is not None else "",
-            "image_name": self.image_path.name if self.image_path is not None else "",
-            "image_size_hw": [int(h), int(w)],
-            "saved_at_utc": saved_at,
-            "model_name": self.model_name_var.get().strip() or DEFAULT_MODEL_NAME,
-            "mask_threshold": float(self.mask_threshold_var.get()),
-            "continuous_mask_only": bool(self.continuous_mask_only_var.get()),
-            "stored_mask_values_kind": "thresholded_binary",
-            "mask_count": int(len(records)),
-            "ignore_mask_count": int(len(ignore_records)),
-            "total_mask_area_px": int(total_mask_area_px),
-            "ignore_total_mask_area_px": int(ignore_total_mask_area_px),
-            "records": records,
-            "ignore_records": ignore_records,
-        }
-        return payload
+        return mask_engine.build_annotation_payload(
+            saved_at=saved_at,
+            image_path=self.image_path,
+            image_shape_hw=(int(h), int(w)),
+            model_name=self.model_name_var.get().strip() or DEFAULT_MODEL_NAME,
+            mask_threshold=float(self.mask_threshold_var.get()),
+            continuous_mask_only=bool(self.continuous_mask_only_var.get()),
+            committed_masks=self.committed_masks,
+            ignore_masks=list(getattr(self, "ignore_masks", [])),
+            session_to_mask_index=self._session_to_mask_index,
+            session_metadata=self._session_metadata,
+            ignore_mask_metadata=list(getattr(self, "_ignore_mask_metadata", [])),
+        )
 
     def _save_annotations_for_current_image(self) -> bool:
         save_path = self._annotation_store_path()
@@ -1658,86 +1766,22 @@ class SamHoverMaskApp:
         if save_path is None or self.image_np is None:
             return False
         try:
-            if not self.committed_masks and not getattr(self, "ignore_masks", []):
-                if save_path.exists():
-                    save_path.unlink()
-                if metadata_path is not None and metadata_path.exists():
-                    metadata_path.unlink()
-                return True
-
             h, w = self.image_np.shape[:2]
-            threshold_for_export = float(self.mask_threshold_var.get())
-            thresholds_for_export = self._thresholds_for_committed_masks(threshold_for_export)
-            ignore_thresholds_for_export = self._thresholds_for_ignore_masks(threshold_for_export)
-            if self.committed_masks:
-                binary_masks = np.stack(
-                    [
-                        np.asarray(
-                            self._binary_mask_with_ignore(
-                                self.committed_masks[idx],
-                                thresholds_for_export[idx],
-                                subtract_ignored=False,
-                            ),
-                            dtype=np.uint8,
-                        )
-                        for idx in range(len(self.committed_masks))
-                    ],
-                    axis=0,
-                )
-            else:
-                binary_masks = np.zeros((0, h, w), dtype=np.uint8)
-            if getattr(self, "ignore_masks", []):
-                ignore_binary_masks = np.stack(
-                    [
-                        np.asarray(
-                            self._binary_ignore_mask_at_index(idx, threshold_for_export),
-                            dtype=np.uint8,
-                        )
-                        for idx in range(len(self.ignore_masks))
-                    ],
-                    axis=0,
-                )
-            else:
-                ignore_binary_masks = np.zeros((0, h, w), dtype=np.uint8)
-
-            packed_masks = np.packbits(binary_masks, axis=2, bitorder="little")
-            ignore_packed_masks = np.packbits(ignore_binary_masks, axis=2, bitorder="little")
-            saved_at = self._utc_now_iso()
-            payload = self._build_annotation_payload(saved_at=saved_at)
-            payload["mask_encoding"] = "bitpack_binary_v1"
-            payload["mask_threshold_mode"] = "per_mask"
-            payload["mask_threshold_applied"] = threshold_for_export
-            payload["mask_thresholds_applied"] = [float(value) for value in thresholds_for_export]
-            payload["ignore_mask_thresholds_applied"] = [
-                float(value) for value in ignore_thresholds_for_export
-            ]
-            payload["mask_shape_nhw"] = [
-                int(binary_masks.shape[0]),
-                int(binary_masks.shape[1]),
-                int(binary_masks.shape[2]),
-            ]
-            payload["ignore_mask_shape_nhw"] = [
-                int(ignore_binary_masks.shape[0]),
-                int(ignore_binary_masks.shape[1]),
-                int(ignore_binary_masks.shape[2]),
-            ]
-            payload["packed_width_bytes"] = int(packed_masks.shape[2])
-            payload["ignore_packed_width_bytes"] = int(ignore_packed_masks.shape[2])
-
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
-            with tmp_path.open("wb") as handle:
-                np.savez_compressed(
-                    handle,
-                    masks_packed=np.asarray(packed_masks, dtype=np.uint8),
-                    masks_shape_nhw=np.asarray(binary_masks.shape, dtype=np.int32),
-                    ignore_masks_packed=np.asarray(ignore_packed_masks, dtype=np.uint8),
-                    ignore_masks_shape_nhw=np.asarray(ignore_binary_masks.shape, dtype=np.int32),
-                    metadata_json=np.asarray(json.dumps(payload), dtype=np.str_),
-                )
-            tmp_path.replace(save_path)
-            if metadata_path is not None:
-                self._write_json_atomic(metadata_path, payload)
+            mask_engine.save_annotations(
+                save_path=save_path,
+                metadata_path=metadata_path,
+                image_path=self.image_path,
+                image_shape_hw=(int(h), int(w)),
+                model_name=self.model_name_var.get().strip() or DEFAULT_MODEL_NAME,
+                mask_threshold=float(self.mask_threshold_var.get()),
+                continuous_mask_only=bool(self.continuous_mask_only_var.get()),
+                committed_masks=self.committed_masks,
+                ignore_masks=list(getattr(self, "ignore_masks", [])),
+                session_to_mask_index=self._session_to_mask_index,
+                session_metadata=self._session_metadata,
+                ignore_mask_metadata=list(getattr(self, "_ignore_mask_metadata", [])),
+                saved_at=self._utc_now_iso(),
+            )
             return True
         except Exception as exc:
             self.status_var.set(f"Warning: autosave failed ({exc})")
@@ -1746,141 +1790,44 @@ class SamHoverMaskApp:
     def _load_annotations_for_current_image(self) -> int:
         save_path = self._annotation_store_path()
         metadata_path = self._annotation_metadata_path()
-        if save_path is None or self.image_np is None:
+
+        def clear_saved_state() -> None:
             self._session_metadata.clear()
             self._ignore_mask_metadata.clear()
             self.ignore_masks.clear()
+
+        if save_path is None or self.image_np is None:
+            clear_saved_state()
             return 0
         if not save_path.exists():
-            self._session_metadata.clear()
-            self._ignore_mask_metadata.clear()
-            self.ignore_masks.clear()
-            return 0
-
-        def unpack_packed_masks(
-            packed: np.ndarray,
-            shape_arr: np.ndarray,
-            label: str,
-        ) -> np.ndarray:
-            if packed.ndim != 3:
-                raise RuntimeError(f"unexpected {label} packed mask shape")
-            if shape_arr.size != 3:
-                raise RuntimeError(f"missing shape metadata for {label} packed masks")
-            n, mh, mw = (int(shape_arr[0]), int(shape_arr[1]), int(shape_arr[2]))
-            if n < 0 or mh <= 0 or mw <= 0:
-                raise RuntimeError(f"invalid saved {label} packed mask dimensions")
-            if n != int(packed.shape[0]) or mh != int(packed.shape[1]):
-                raise RuntimeError(f"{label} packed mask dimensions do not match shape metadata")
-            if mw > int(packed.shape[2]) * 8:
-                raise RuntimeError(f"{label} packed mask width metadata exceeds packed payload width")
-            return np.unpackbits(
-                packed,
-                axis=2,
-                count=mw,
-                bitorder="little",
-            ).astype(np.float32)
-
-        loaded_masks_are_binary = False
-        loaded_ignore_masks_are_binary = False
-        try:
-            with np.load(save_path, allow_pickle=False) as data:
-                metadata_json = data["metadata_json"] if "metadata_json" in data.files else None
-                if "masks_packed" in data.files:
-                    loaded_masks_are_binary = True
-                    masks = unpack_packed_masks(
-                        np.asarray(data["masks_packed"], dtype=np.uint8),
-                        np.asarray(data["masks_shape_nhw"], dtype=np.int64).reshape(-1)
-                        if "masks_shape_nhw" in data.files
-                        else np.asarray([], dtype=np.int64),
-                        "saved",
-                    )
-                elif "masks" in data.files:
-                    masks = np.asarray(data["masks"])
-                else:
-                    raise RuntimeError("saved annotations missing mask payload")
-
-                if "ignore_masks_packed" in data.files:
-                    loaded_ignore_masks_are_binary = True
-                    ignore_masks = unpack_packed_masks(
-                        np.asarray(data["ignore_masks_packed"], dtype=np.uint8),
-                        np.asarray(data["ignore_masks_shape_nhw"], dtype=np.int64).reshape(-1)
-                        if "ignore_masks_shape_nhw" in data.files
-                        else np.asarray([], dtype=np.int64),
-                        "ignore",
-                    )
-                elif "ignore_masks" in data.files:
-                    ignore_masks = np.asarray(data["ignore_masks"])
-                else:
-                    ignore_masks = np.zeros((0, 1, 1), dtype=np.float32)
-        except Exception as exc:
-            self.status_var.set(f"Warning: could not load saved annotations ({exc})")
-            self._session_metadata.clear()
-            self._ignore_mask_metadata.clear()
-            self.ignore_masks.clear()
-            return 0
-
-        if masks.ndim != 3:
-            self.status_var.set("Warning: saved annotations ignored (unexpected mask shape).")
-            self._session_metadata.clear()
-            self._ignore_mask_metadata.clear()
-            self.ignore_masks.clear()
-            return 0
-        if ignore_masks.ndim != 3:
-            self.status_var.set("Warning: saved annotations ignored (unexpected ignore mask shape).")
-            self._session_metadata.clear()
-            self._ignore_mask_metadata.clear()
-            self.ignore_masks.clear()
+            clear_saved_state()
             return 0
 
         h, w = self.image_np.shape[:2]
-        if tuple(masks.shape[1:]) != (h, w):
-            self.status_var.set("Saved annotations found, but size does not match this image.")
-            self._session_metadata.clear()
-            self._ignore_mask_metadata.clear()
-            self.ignore_masks.clear()
+        try:
+            loaded = mask_engine.load_annotations(
+                save_path=save_path,
+                metadata_path=metadata_path,
+                image_shape_hw=(int(h), int(w)),
+            )
+        except Exception as exc:
+            message = str(exc)
+            if message == "unexpected mask shape":
+                self.status_var.set("Warning: saved annotations ignored (unexpected mask shape).")
+            elif message == "unexpected ignore mask shape":
+                self.status_var.set(
+                    "Warning: saved annotations ignored (unexpected ignore mask shape)."
+                )
+            elif message == "mask size mismatch":
+                self.status_var.set("Saved annotations found, but size does not match this image.")
+            elif message == "ignore mask size mismatch":
+                self.status_var.set(
+                    "Saved ignore annotations found, but size does not match this image."
+                )
+            else:
+                self.status_var.set(f"Warning: could not load saved annotations ({exc})")
+            clear_saved_state()
             return 0
-        if int(ignore_masks.shape[0]) == 0:
-            ignore_masks = np.zeros((0, h, w), dtype=np.float32)
-        elif tuple(ignore_masks.shape[1:]) != (h, w):
-            self.status_var.set("Saved ignore annotations found, but size does not match this image.")
-            self._session_metadata.clear()
-            self._ignore_mask_metadata.clear()
-            self.ignore_masks.clear()
-            return 0
-
-        payload: dict[str, Any] = {}
-        if metadata_json is not None:
-            try:
-                if np.ndim(metadata_json) == 0:
-                    metadata_text = str(metadata_json.item())
-                else:
-                    metadata_text = str(np.asarray(metadata_json).reshape(-1)[0])
-                if metadata_text:
-                    loaded_payload = json.loads(metadata_text)
-                    if isinstance(loaded_payload, dict):
-                        payload = loaded_payload
-            except Exception:
-                payload = {}
-        if not payload:
-            payload = self._load_json_object_optional(metadata_path)
-
-        records: list[Any] = []
-        loaded_records = payload.get("records", [])
-        if isinstance(loaded_records, list):
-            records = loaded_records
-        ignore_records: list[Any] = []
-        loaded_ignore_records = payload.get("ignore_records", [])
-        if isinstance(loaded_ignore_records, list):
-            ignore_records = loaded_ignore_records
-        payload_marks_binary = self._metadata_marks_binary_mask(payload)
-        thresholds_applied_raw = payload.get("mask_thresholds_applied", [])
-        thresholds_applied = thresholds_applied_raw if isinstance(thresholds_applied_raw, list) else []
-        ignore_thresholds_applied_raw = payload.get("ignore_mask_thresholds_applied", [])
-        ignore_thresholds_applied = (
-            ignore_thresholds_applied_raw
-            if isinstance(ignore_thresholds_applied_raw, list)
-            else []
-        )
 
         self.last_mask = None
         self.pos_points.clear()
@@ -1895,97 +1842,14 @@ class SamHoverMaskApp:
         self._session_to_mask_index.clear()
         self._session_metadata.clear()
 
-        for idx in range(int(masks.shape[0])):
-            self.committed_masks.append(np.asarray(masks[idx], dtype=np.float32))
-            rec = records[idx] if idx < len(records) and isinstance(records[idx], dict) else {}
-            sid_raw = rec.get("session_id", idx + 1)
-            try:
-                session_id = int(sid_raw)
-            except Exception:
-                session_id = idx + 1
-            while session_id <= 0 or session_id in self._session_to_mask_index:
-                session_id += 1
-            rec_data = dict(rec)
-            rec_data["session_id"] = int(session_id)
-            rec_data["mask_index"] = int(idx)
-
-            threshold_applied = None
-            if idx < len(thresholds_applied):
-                threshold_applied = parse_float_like(thresholds_applied[idx])
-            if threshold_applied is None:
-                threshold_applied = parse_float_like(payload.get("mask_threshold_applied"))
-            if threshold_applied is None:
-                threshold_applied = parse_float_like(payload.get("mask_threshold"))
-            if threshold_applied is not None:
-                rec_data.setdefault("threshold_last_saved", float(threshold_applied))
-                rec_data.setdefault("threshold_at_click", float(threshold_applied))
-                rec_data.setdefault("threshold_applied_to_saved_mask", float(threshold_applied))
-
-            mask_values_are_binary = bool(
-                loaded_masks_are_binary
-                or payload_marks_binary
-                or self._metadata_marks_binary_mask(rec_data)
-                or self._array_values_are_binary(masks[idx])
-            )
-            if mask_values_are_binary:
-                rec_data["mask_values_are_binary"] = True
-                rec_data["mask_values_kind"] = "thresholded_binary"
-                binary = np.asarray(masks[idx] > 0.5)
-                area_px, bbox_xyxy = self._mask_area_and_bbox(binary)
-                rec_data.setdefault("mask_area_px", int(area_px))
-                rec_data.setdefault("mask_bbox_xyxy", bbox_xyxy)
-            else:
-                rec_data["mask_values_are_binary"] = False
-                rec_data.setdefault("mask_values_kind", "sam_logits")
-
-            self._session_to_mask_index[int(session_id)] = int(idx)
-            self._session_metadata[int(session_id)] = rec_data
-
-        for idx in range(int(ignore_masks.shape[0])):
-            self.ignore_masks.append(np.asarray(ignore_masks[idx], dtype=np.float32))
-            rec = (
-                ignore_records[idx]
-                if idx < len(ignore_records) and isinstance(ignore_records[idx], dict)
-                else {}
-            )
-            rec_data = dict(rec)
-            rec_data["ignore_index"] = int(idx)
-
-            threshold_applied = None
-            if idx < len(ignore_thresholds_applied):
-                threshold_applied = parse_float_like(ignore_thresholds_applied[idx])
-            if threshold_applied is None:
-                threshold_applied = parse_float_like(payload.get("mask_threshold_applied"))
-            if threshold_applied is None:
-                threshold_applied = parse_float_like(payload.get("mask_threshold"))
-            if threshold_applied is not None:
-                rec_data.setdefault("threshold_last_saved", float(threshold_applied))
-                rec_data.setdefault("threshold_at_click", float(threshold_applied))
-                rec_data.setdefault("threshold_applied_to_saved_mask", float(threshold_applied))
-
-            mask_values_are_binary = bool(
-                loaded_ignore_masks_are_binary
-                or payload_marks_binary
-                or self._metadata_marks_binary_mask(rec_data)
-                or self._array_values_are_binary(ignore_masks[idx])
-            )
-            if mask_values_are_binary:
-                rec_data["mask_values_are_binary"] = True
-                rec_data["mask_values_kind"] = "thresholded_binary"
-                binary = np.asarray(ignore_masks[idx] > 0.5)
-                area_px, bbox_xyxy = self._mask_area_and_bbox(binary)
-                rec_data.setdefault("mask_area_px", int(area_px))
-                rec_data.setdefault("mask_bbox_xyxy", bbox_xyxy)
-            else:
-                rec_data["mask_values_are_binary"] = False
-                rec_data.setdefault("mask_values_kind", "sam_logits")
-            self._ignore_mask_metadata.append(rec_data)
-
-        max_session = max(self._session_to_mask_index.keys(), default=0)
-        self._active_session_id = int(max_session + 1) if max_session > 0 else 0
+        self.committed_masks.extend(loaded.masks)
+        self.ignore_masks.extend(loaded.ignore_masks)
+        self._ignore_mask_metadata.extend(loaded.ignore_mask_metadata)
+        self._session_to_mask_index.update(loaded.session_to_mask_index)
+        self._session_metadata.update(loaded.session_metadata)
+        self._active_session_id = int(loaded.active_session_id)
         self._invalidate_committed_overlay_cache()
         return len(self.committed_masks)
-
     def _prepare_display_base(self, reset_view: bool = False) -> None:
         if self.image_pil is None:
             return
@@ -2278,31 +2142,17 @@ class SamHoverMaskApp:
         threshold: float,
         continuous_mask_only: bool,
     ) -> dict[str, Any]:
-        now = self._utc_now_iso()
         h, w = self.image_np.shape[:2]
-        binary = np.asarray(np.asarray(mask, dtype=np.float32) > float(threshold))
-        area_px, bbox_xyxy = self._mask_area_and_bbox(binary)
-        return {
-            "kind": "ignore",
-            "ignore_index": int(ignore_index),
-            "seed_point_xy": [float(seed_point[0]), float(seed_point[1])],
-            "seed_point_xy_round": [int(round(seed_point[0])), int(round(seed_point[1]))],
-            "created_at_utc": now,
-            "last_updated_utc": now,
-            "image_size_hw": [int(h), int(w)],
-            "model_name": self.model_name_var.get().strip() or DEFAULT_MODEL_NAME,
-            "threshold_at_click": float(threshold),
-            "threshold_last_saved": float(threshold),
-            "continuous_mask_only_at_click": bool(continuous_mask_only),
-            "mask_values_are_binary": False,
-            "mask_values_kind": "sam_logits",
-            "mask_area_px": int(area_px),
-            "mask_bbox_xyxy": bbox_xyxy,
-            "mask_logit_min": float(np.min(mask)),
-            "mask_logit_max": float(np.max(mask)),
-            "mask_logit_mean": float(np.mean(mask)),
-        }
-
+        return mask_engine.build_ignore_mask_metadata(
+            ignore_index=ignore_index,
+            seed_point=seed_point,
+            mask=mask,
+            threshold=threshold,
+            continuous_mask_only=continuous_mask_only,
+            saved_at=self._utc_now_iso(),
+            image_shape_hw=(int(h), int(w)),
+            model_name=self.model_name_var.get().strip() or DEFAULT_MODEL_NAME,
+        )
     def _display_radius_to_image_radius(self, radius_display_px: float) -> float:
         if self.image_np is None:
             return float(radius_display_px)
@@ -3116,11 +2966,18 @@ def run_stage_for_runner(source_input: Path, params: dict[str, Any]) -> dict[str
         decoder_path=decoder_path,
         image_size=int(model.image_size),
     )
+    model_cache_metadata = build_model_cache_metadata(
+        model_name=model_name,
+        encoder_path=encoder_path,
+        decoder_path=decoder_path,
+        image_size=int(model.image_size),
+    )
     embedding_cache_path = save_embedding_cache_for_image(
         image_path=source_input,
         image_np=image_np,
         embedding=embedding,
         model_cache_token=model_cache_token,
+        model_metadata=model_cache_metadata,
     )
 
     annotation_path = annotation_store_path_for_image(source_input)

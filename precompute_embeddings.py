@@ -21,7 +21,11 @@ from sam_hover_mask_gui import (
     MODELS_DIR,
     SUPPORTED_IMAGE_EXTENSIONS,
     SegmentAnythingOnnx,
+    build_model_cache_metadata,
     build_model_cache_token,
+    embedding_cache_candidate_paths_for_image,
+    embedding_cache_payload_matches_image,
+    embedding_cache_payload_matches_model,
     embedding_store_path_for_image,
     save_embedding_cache_for_image,
 )
@@ -162,29 +166,31 @@ def load_embedding_metadata(cache_path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def is_embedding_cache_fresh(image_path: Path, model_cache_token: str) -> bool:
-    cache_path = embedding_store_path_for_image(image_path, model_cache_token)
-    payload = load_embedding_metadata(cache_path)
-    if not payload:
-        return False
-    if payload.get("model_cache_token") != model_cache_token:
-        return False
-
-    try:
-        stat = image_path.stat()
-    except Exception:
-        return False
-
-    cached_size = payload.get("image_file_size_bytes")
-    cached_mtime_ns = payload.get("image_mtime_ns")
-    try:
-        if cached_size is not None and int(cached_size) != int(stat.st_size):
-            return False
-        if cached_mtime_ns is not None and int(cached_mtime_ns) != int(stat.st_mtime_ns):
-            return False
-    except Exception:
-        return False
-    return True
+def is_embedding_cache_fresh(
+    image_path: Path,
+    model_cache_token: str,
+    model_metadata: dict[str, Any],
+) -> bool:
+    candidates = [path for path in embedding_cache_candidate_paths_for_image(
+        image_path,
+        model_cache_token,
+    ) if path.exists()]
+    allow_unknown_legacy = len(candidates) == 1
+    for cache_path in candidates:
+        payload = load_embedding_metadata(cache_path)
+        if not payload:
+            continue
+        if not embedding_cache_payload_matches_image(payload, image_path):
+            continue
+        if not embedding_cache_payload_matches_model(
+            payload,
+            model_cache_token,
+            model_metadata,
+            allow_legacy_unknown_token=allow_unknown_legacy,
+        ):
+            continue
+        return True
+    return False
 
 
 def load_image_rgb(image_path: Path) -> np.ndarray:
@@ -219,6 +225,12 @@ def main() -> int:
         decoder_path=decoder_path,
         image_size=int(model.image_size),
     )
+    model_cache_metadata = build_model_cache_metadata(
+        model_name=args.model_name,
+        encoder_path=encoder_path,
+        decoder_path=decoder_path,
+        image_size=int(model.image_size),
+    )
 
     started_at = utc_now_iso()
     cached = 0
@@ -235,7 +247,11 @@ def main() -> int:
         rel_path = image_path.relative_to(root_folder)
         cache_path = embedding_store_path_for_image(image_path, model_cache_token)
 
-        if not args.force and is_embedding_cache_fresh(image_path, model_cache_token):
+        if not args.force and is_embedding_cache_fresh(
+            image_path,
+            model_cache_token,
+            model_cache_metadata,
+        ):
             skipped += 1
             print(f"[{index}/{total}] skip fresh: {rel_path}", flush=True)
             records.append(
@@ -259,6 +275,7 @@ def main() -> int:
                 image_np=image_np,
                 embedding=embedding,
                 model_cache_token=model_cache_token,
+                model_metadata=model_cache_metadata,
             )
             cached += 1
             print(f"[{index}/{total}] cached: {rel_path}", flush=True)
