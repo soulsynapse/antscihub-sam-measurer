@@ -25,7 +25,7 @@ TODO: Add a video of the workflow.
 |---|---|
 | Click-to-segment | Left click runs SAM and commits a mask; right click removes nearby masks or points. |
 | Live hover preview | The mask preview follows the mouse before you click. |
-| Multiple masks per image | `n` starts a new object; each gets its own record. |
+| Multiple masks per image | Each committed mask automatically starts a new object session. |
 | Ignored regions | `Ctrl`+click marks areas that are subtracted from all masks; `Ctrl`+right-click removes them. |
 | Continuous mask mode | Retains only the connected component touching the click point, cutting out stray patches. |
 | Selection outline | Optional 1-pixel outline around the active mask; color is selectable from a dropdown. |
@@ -162,7 +162,6 @@ You can choose other model weights from the model dropdown:
 - `Ctrl` + right click: remove a nearby ignored region.
 - Mouse wheel: increase or decrease mask sensitivity.
 - `Shift` + mouse wheel: pan horizontally while zoomed.
-- `n`: start a new object.
 - `c`: clear prompts.
 
 Sensitivity is the `Mask threshold` value. Typically you want to keep it at `0.00`. Increasing or decreasing sensitivity can subtly adjust which pixels the model includes, but if you need accuracy, cropping or tiling the image is usually the better move.

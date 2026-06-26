@@ -736,7 +736,6 @@ class SamHoverMaskApp:
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
         self.canvas.bind("<Button-4>", self._on_mouse_wheel)
         self.canvas.bind("<Button-5>", self._on_mouse_wheel)
-        self.root.bind("n", lambda _e: self._start_new_mask_session())
         self.root.bind("c", lambda _e: self._clear_prompts())
         self.root.bind("<Left>", lambda _e: self._navigate_prev_image())
         self.root.bind("<Right>", lambda _e: self._navigate_next_image())
