@@ -4,3 +4,7 @@ __pycache__/
 
 # Local sample/input data.
 Test files/
+
+# AI agent working directories.
+.agents/
+.codex/
