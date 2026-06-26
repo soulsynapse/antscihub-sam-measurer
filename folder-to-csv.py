@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from version import __version__
 import csv
 import json
 import re
@@ -88,6 +89,7 @@ def parse_args() -> argparse.Namespace:
             f"{DEFAULT_OUTPUT_CSV_NAME} in the selected folder."
         ),
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args()
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from version import __version__
 import hashlib
 import json
 import os
@@ -78,6 +79,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional params JSON to pre-load when launching GUI directly.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args()
 
 
@@ -544,7 +546,7 @@ class SamHoverMaskApp:
         initial_params: dict[str, Any] | None = None,
     ) -> None:
         self.root = root
-        self.root.title("SAM Hover Mask")
+        self.root.title(f"SAM Hover Mask {__version__}")
         self.root.geometry("1280x860")
 
         self.model: SegmentAnythingOnnx | None = None

@@ -4,6 +4,70 @@ Lightweight desktop GUI to measure objects in images using Segment Anything (SAM
 
 ![SAM measurer GUI example](docs/images/sam-measurer-example.png)
 
+## Scope, or, who this tool is for:
+This tool is meant to do one thing well: **If you have an appropriate job**, it will speed up your imagej measurement workflows by *at least* 10x.
+
+All future versions will be to that end.
+
+For a job to be appropriate:
+
+1. The subject needs to be appropriately isolated. Joined subjects don't work well.
+2. The quality needs to be relatively crisp.
+3. The image itself can't be massive. It still works with large images, just.. not very well.
+
+TODO: Add a video of the workflow.
+
+## Current features:
+
+**Mask GUI**
+* Click-to-segment — left click runs SAM and commits a mask; right click removes nearby masks or points.
+* Live hover preview — the mask preview follows the mouse before you click.
+* Multiple masks per image — `n` starts a new object; each gets its own record.
+* Ignored regions — `Ctrl`+click marks areas that are subtracted from all masks; `Ctrl`+right-click removes them.
+* Continuous mask mode — retains only the connected component touching the click point, which cuts out stray patches.
+* Selection outline — optional 1-pixel outline around the active mask; color is selectable from a dropdown.
+* Mask sensitivity — mouse wheel adjusts the logit threshold live.
+* Zoom and pan — `Ctrl`+wheel to zoom around the cursor, middle-mouse drag to pan, `Shift`+wheel to pan horizontally.
+* Folder navigation — Prev/Next buttons and arrow/A/D/Space keys to step through all images in a folder.
+* Four SAM model variants — accuracy (ViT-H, default), balanced, speed, and EdgeSAM; selected from a dropdown.
+* Auto-download — missing ONNX weights are fetched automatically on first use.
+* Autosave — every committed mask is immediately written to `.sam_clicks.json` and `.sam_clicks.npz` next to the image.
+* Embedding cache — SAM image embeddings are cached to `.sam_embedding.npz` so reopening an image is fast.
+
+**QC tool**
+* Browse an annotated folder and step through every individual mask.
+* Cropped, zoomed preview of each masked subject at its bounding box.
+* Scrollable stats sidebar showing a mask summary card and all raw metadata fields.
+* Real-world area displayed when a scale-bar config is present in the folder.
+* Color-selectable outline on the preview; keyboard navigation with arrow keys, A/D.
+
+**Scale bar config**
+* Click two endpoints on a reference scale bar, enter the known length and unit, press Accept.
+* Preloads an existing config from the folder so re-editing is non-destructive.
+* Saves a single calibration JSON that covers the whole image folder.
+
+**Batch embedding precompute**
+* Recursively walks a folder tree and precomputes SAM embeddings for every image.
+* Skips images that already have a fresh cache; downloads the selected model if needed.
+* `--force` flag to recompute everything; optional `--summary-json` output.
+
+**CSV export**
+* Reads the folder's scale-bar config and all annotation JSONs, then writes `sam_mask_measurements.csv`.
+* Measurement columns first: image name, mask number, pixel area, `units_per_pixel`, computed area and unit.
+* Full flattened metadata appended as additional columns for filtering in a spreadsheet.
+
+## Future features, or the to-do:
+
+### User friendliness
+* Add a video of a typical workflow.
+* Integrate different features to one user friendly dash.
+* Set up conda wheel or whatever is easiest.
+
+### Feats
+* Optional tiled embeddings as part of the precompute phase, based on some relative subject size. Ideally it can get to native resolution detection for subjects that fit.
+* Programmatic handoff of click location. If you can auto detect an object (dino), it can try to mask it.
+* Jitter look around and matching to example outlines.
+
 ## Install
 
 Use Git to pull this project into a folder on your computer. VS Code is the recommended way to work with it because you can keep the folder, terminal, and virtual environment visible in one place.
@@ -29,6 +93,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+
 If setup worked, you should have:
 
 - VS Code open to the `antscihub-sam-measurer` folder.
@@ -38,11 +103,14 @@ If setup worked, you should have:
 
 Required packages include `onnxruntime`, `numpy`, `Pillow`, and `gdown`.
 
+Once you have it in vscode, you can click any file and click the play button and it'll prompt you to open folders, which file you want, etc. You can run it typing into terminal if you want though.
+
+
 ## Typical Workflow
 
-1. **Calibrate** — Run `scale_bar_config.py` on the image that contains your scale bar. Click the two ends, enter the known length and unit, and press `Accept`. One config file covers the whole folder.
+1. **Calibrate** — Run `scale_bar_config.py` on the image that contains your scale bar. Click the two ends, enter the known length and unit, and press `Accept`. One config file covers the whole folder. Current logic for 
 
-2. **Precompute** (optional, recommended for large batches) — Run `precompute_embeddings.py` on your image folder to cache SAM embeddings before you start clicking. Skip this for small jobs; the GUI caches on demand.
+2. **Precompute** (optional, recommended for large batches) — Run `precompute_embeddings.py` on your image folder to cache SAM embeddings before you start clicking.
 
 3. **Annotate** — Open `sam_hover_mask_gui.py`, load each image, and click objects to create and save masks.
 

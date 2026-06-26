@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from version import __version__
 import ast
 import csv
 import json
@@ -82,6 +83,7 @@ def parse_args() -> argparse.Namespace:
             f"{DEFAULT_OUTPUT_CSV_NAME} inside the source folder."
         ),
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args()
 
 
@@ -685,7 +687,7 @@ class SamMaskQcApp:
         self._render_current()
 
     def _build_ui(self) -> None:
-        self.root.title("SAM Mask QC")
+        self.root.title(f"SAM Mask QC {__version__}")
         self.root.geometry("1200x800")
         self.root.minsize(760, 480)
 

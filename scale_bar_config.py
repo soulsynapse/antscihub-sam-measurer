@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from version import __version__
 import json
 import math
 import os
@@ -44,6 +45,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional params JSON path for GUI preload.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args()
 
 
@@ -632,7 +634,7 @@ def launch_gui(initial_source_input: Path | None, params: dict[str, Any], existi
     class ScaleBarWindow:
         def __init__(self) -> None:
             self.root = tk.Tk()
-            self.root.title("Scale Bar Config")
+            self.root.title(f"Scale Bar Config {__version__}")
             self.root.geometry("1700x980")
             self.root.after(50, self.open_full_screen)
             self.root.after(100, lambda: bring_tk_window_to_front(self.root))

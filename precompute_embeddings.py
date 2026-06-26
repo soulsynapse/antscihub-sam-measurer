@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from version import __version__
 import json
 import sys
 from datetime import datetime, timezone
@@ -75,6 +76,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional summary JSON path. Defaults to no summary file.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args()
 
 
