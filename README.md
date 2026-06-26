@@ -1,15 +1,12 @@
 # antscihub-sam-measurer
 
-Lightweight desktop GUI to measure objects in images using Segment Anything
-(SAM).
+Lightweight desktop GUI to measure objects in images using Segment Anything (SAM).
 
 ![SAM measurer GUI example](docs/images/sam-measurer-example.png)
 
 ## Install
 
-Use Git to pull this project into a folder on your computer. VS Code is the
-recommended way to work with it because you can keep the folder, terminal, and
-virtual environment visible in one place.
+Use Git to pull this project into a folder on your computer. VS Code is the recommended way to work with it because you can keep the folder, terminal, and virtual environment visible in one place.
 
 ```powershell
 git clone <repo-url> antscihub-sam-measurer
@@ -17,15 +14,13 @@ cd antscihub-sam-measurer
 code .
 ```
 
-If you already cloned the folder earlier, open that folder in VS Code and update
-it with:
+If you already cloned the folder earlier, open that folder in VS Code and update it with:
 
 ```powershell
 git pull
 ```
 
-In the VS Code terminal, create a virtual environment in this folder and install
-the requirements:
+In the VS Code terminal, create a virtual environment in this folder and install the requirements:
 
 ```powershell
 python -m venv .venv
@@ -61,19 +56,11 @@ Start the main click tool from the VS Code terminal:
 python sam_hover_mask_gui.py
 ```
 
-The first launch may look like it is hanging while it downloads SAM model
-weights. Watch the VS Code terminal: the download progress should appear there.
-The default model is `Segment-Anything (accuracy)`, which uses the quantized
-ViT-H ONNX weights. Expect about 665 MB of model files for the default model.
-Weights are stored in `models/`, so this should only happen once per model.
+The first launch may look like it is hanging while it downloads SAM model weights. Watch the VS Code terminal: the download progress should appear there. The default model is `Segment-Anything (accuracy)`, which uses the quantized ViT-H ONNX weights. Expect about 665 MB of model files for the default model. Weights are stored in `models/`, so this should only happen once per model.
 
 After the model is ready, open an image and start clicking objects.
 
-SAM runs internally at a 1024-pixel model size. For best precision, use images
-where the object you care about is large enough to be well represented at that
-scale. If a full image is very large or contains many small subjects, consider
-cropping or cutting it into tiles before measuring; this often improves
-detection more reliably than sensitivity tweaks.
+SAM runs internally at a 1024-pixel model size. For best precision, use images where the object you care about is large enough to be well represented at that scale. If a full image is very large or contains many small subjects, consider cropping or cutting it into tiles before measuring; this often improves detection more reliably than sensitivity tweaks.
 
 You can choose other model weights from the model dropdown:
 
@@ -88,33 +75,24 @@ You can choose other model weights from the model dropdown:
 - Hold middle mouse button and drag: pan around the image.
 - Left click: assign a mask for the current object.
 - Right click: remove a nearby mask or point.
-- `Ctrl` + left click: assign an ignored region, which is subtracted from
-  masks.
+- `Ctrl` + left click: assign an ignored region, which is subtracted from masks.
 - `Ctrl` + right click: remove a nearby ignored region.
 - Mouse wheel: increase or decrease mask sensitivity.
 - `Shift` + mouse wheel: pan horizontally while zoomed.
 - `n`: start a new object.
 - `c`: clear prompts.
 
-Sensitivity is the `Mask threshold` value. Typically you want to keep it at
-`0.00`. Increasing or decreasing sensitivity can subtly adjust which pixels the
-model includes, but if you need accuracy, cropping or tiling the image is usually
-the better move.
+Sensitivity is the `Mask threshold` value. Typically you want to keep it at `0.00`. Increasing or decreasing sensitivity can subtly adjust which pixels the model includes, but if you need accuracy, cropping or tiling the image is usually the better move.
 
 ## Autosaved Mask Data
 
-As soon as a mask is calculated, the tool saves annotation files next to the
-image:
+As soon as a mask is calculated, the tool saves annotation files next to the image:
 
 - `<image>.sam_clicks.json`: human-readable metadata.
 - `<image>.sam_clicks.npz`: compact bit-packed mask data.
 - `<image>.<hash>.sam_embedding.npz`: cached SAM embedding for faster reopening.
 
-The JSON has the information needed to inspect or export the mask: image name,
-image size, model name, click location, mask number, pixel area, bounding box,
-threshold/sensitivity, continuous-mask setting, ignored-region metadata, and
-other mask statistics. The exact list of captured fields is visible by opening
-the JSON file directly, or by opening the folder in the QC tool.
+The JSON has the information needed to inspect or export the mask: image name, image size, model name, click location, mask number, pixel area, bounding box, threshold/sensitivity, continuous-mask setting, ignored-region metadata, and other mask statistics. The exact list of captured fields is visible by opening the JSON file directly, or by opening the folder in the QC tool.
 
 Run the QC viewer with:
 
@@ -122,15 +100,11 @@ Run the QC viewer with:
 python sam_mask_qc_tool.py "path\to\image-folder"
 ```
 
-The QC tool lets you quickly step through masks, inspect the masked subject,
-view the stats table, and see scale-derived values when a scale-bar config is
-available.
+The QC tool lets you quickly step through masks, inspect the masked subject, view the stats table, and see scale-derived values when a scale-bar config is available.
 
 ## Batch Processing
 
-When you load or browse images in the GUI, you may notice a slow `Computing
-embedding` step. That embedding is cached per image and model, but the first pass
-can take a while.
+When you load or browse images in the GUI, you may notice a slow `Computing embedding` step. That embedding is cached per image and model, but the first pass can take a while.
 
 To compute embeddings ahead of time for a whole folder tree, run:
 
@@ -138,9 +112,7 @@ To compute embeddings ahead of time for a whole folder tree, run:
 python precompute_embeddings.py --source-folder "path\to\image-folder"
 ```
 
-This recursively scans the selected folder and all child folders, downloads the
-selected model if needed, skips fresh caches, and writes the same embedding files
-the GUI uses. Use `--force` if you intentionally want to recompute everything.
+This recursively scans the selected folder and all child folders, downloads the selected model if needed, skips fresh caches, and writes the same embedding files the GUI uses. Use `--force` if you intentionally want to recompute everything.
 
 Optional summary output:
 
@@ -150,42 +122,31 @@ python precompute_embeddings.py --source-folder "path\to\image-folder" --summary
 
 ## Scale Bar Config
 
-If you need real-world units, run the scale-bar config tool on an image that
-contains a known scale bar:
+If you need real-world units, run the scale-bar config tool on an image that contains a known scale bar:
 
 ```powershell
 python scale_bar_config.py --source-input "path\to\image-folder\scale-bar-image.jpg"
 ```
 
-Click the two ends of the scale bar, enter the known length and unit, then press
-`Accept`. This writes:
+Click the two ends of the scale bar, enter the known length and unit, then press `Accept`. This writes:
 
 - `<image-stem>.scale_bar_config.result.json`
 
-Typically you want one scale-bar config file per image folder. The CSV exporter
-and QC tool will use it to compute relative values such as area in `mm^2` or
-length in `mm`. If the source folder already has a scale-bar config, the
-scale-bar helper opens the matching reference image and preloads its saved
-points, known length, and unit.
+Typically you want one scale-bar config file per image folder. The CSV exporter and QC tool will use it to compute relative values such as area in `mm^2` or length in `mm`. If the source folder already has a scale-bar config, the scale-bar helper opens the matching reference image and preloads its saved points, known length, and unit.
 
 ## Export Measurements
 
-After annotating images and creating a scale-bar config, export measurements for
-a folder:
+After annotating images and creating a scale-bar config, export measurements for a folder:
 
 ```powershell
 python folder-to-csv.py --source-folder "path\to\image-folder"
 ```
 
-This reads the newest `*.scale_bar_config.result.json` in the folder and all
-`*.sam_clicks.json` files in that folder, then writes:
+This reads the newest `*.scale_bar_config.result.json` in the folder and all `*.sam_clicks.json` files in that folder, then writes:
 
 - `sam_mask_measurements.csv`
 
-The CSV keeps the measurement columns first, including image name, mask/click
-number, pixel area, `units_per_pixel`, computed area, and computed area unit. It
-also appends flattened metadata from the scale-bar config, the annotation JSON,
-and each mask record.
+The CSV keeps the measurement columns first, including image name, mask/click number, pixel area, `units_per_pixel`, computed area, and computed area unit. It also appends flattened metadata from the scale-bar config, the annotation JSON, and each mask record.
 
 ## Where Information Lives
 
@@ -208,18 +169,12 @@ Examples of useful fields:
 - Scale conversion: `scale_bar.units_per_pixel` in the scale-bar config.
 - Computed CSV area: `computed_area` and `computed_area_unit`.
 
-The JSON files are the detailed record. The CSV is the convenient spreadsheet.
-The QC tool is the fastest way to visually verify that a mask and its stats are
-the ones you meant to measure.
+The JSON files are the detailed record. The CSV is the convenient spreadsheet. The QC tool is the fastest way to visually verify that a mask and its stats are the ones you meant to measure.
 
 ## License and Attribution
 
-This project is licensed under CC BY-NC 4.0. It was heavily inspired by
-Annolid, which is copyright (c) 2024 Computational Physiology Laboratory and is
-also distributed under CC BY-NC 4.0.
+This project is licensed under CC BY-NC 4.0. It was heavily inspired by Annolid, which is copyright (c) 2024 Computational Physiology Laboratory and is also distributed under CC BY-NC 4.0.
 
-I made this project because I could not figure out how to get Annolid working
-for my workflow, but Annolid's methods were clear enough to guide this smaller,
-focused SAM measurement tool.
+I made this project because I could not figure out how to get Annolid working for my workflow, but Annolid's methods were clear enough to guide this smaller, focused SAM measurement tool.
 
 See [LICENSE](LICENSE) for the full local attribution notice.
