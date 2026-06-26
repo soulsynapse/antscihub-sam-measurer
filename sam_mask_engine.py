@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,31 @@ class AnnotationLoadResult:
     ignore_mask_metadata: list[dict[str, Any]]
     active_session_id: int
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class MaskCaliperResult:
+    distance_px: float
+    point_a_xy: tuple[int, int]
+    point_b_xy: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class MaskHullResult:
+    points_xy: list[tuple[int, int]]
+    area_px: float
+    mask_area_px: int
+    solidity: float | None
+
+
+@dataclass(frozen=True)
+class MaskEllipseResult:
+    center_xy: tuple[float, float]
+    major_axis_length_px: float
+    minor_axis_length_px: float
+    angle_degrees: float
+    area_px: float
+    eccentricity: float
 
 
 def parse_bool_like(raw: Any) -> bool | None:
@@ -280,6 +306,168 @@ def mask_area_and_bbox(binary: np.ndarray) -> tuple[int, list[int] | None]:
     return area_px, [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
 
 
+def _cross_xy(
+    origin: tuple[int, int],
+    a: tuple[int, int],
+    b: tuple[int, int],
+) -> int:
+    return (a[0] - origin[0]) * (b[1] - origin[1]) - (a[1] - origin[1]) * (b[0] - origin[0])
+
+
+def _distance_sq_xy(a: tuple[int, int], b: tuple[int, int]) -> int:
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    return dx * dx + dy * dy
+
+
+def convex_hull_xy(points_xy: np.ndarray) -> list[tuple[int, int]]:
+    points = np.asarray(points_xy)
+    if points.ndim != 2 or points.shape[1] != 2 or points.shape[0] == 0:
+        return []
+    order = np.lexsort((points[:, 1], points[:, 0]))
+    sorted_points = [
+        (int(points[index, 0]), int(points[index, 1]))
+        for index in order
+    ]
+    unique_points = list(dict.fromkeys(sorted_points))
+    if len(unique_points) <= 1:
+        return unique_points
+
+    lower: list[tuple[int, int]] = []
+    for point in unique_points:
+        while len(lower) >= 2 and _cross_xy(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+
+    upper: list[tuple[int, int]] = []
+    for point in reversed(unique_points):
+        while len(upper) >= 2 and _cross_xy(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+
+    return lower[:-1] + upper[:-1]
+
+
+def longest_caliper_on_hull(hull_xy: list[tuple[int, int]]) -> MaskCaliperResult | None:
+    point_count = len(hull_xy)
+    if point_count == 0:
+        return None
+    if point_count == 1:
+        point = hull_xy[0]
+        return MaskCaliperResult(0.0, point, point)
+    if point_count == 2:
+        a, b = hull_xy
+        return MaskCaliperResult(float(_distance_sq_xy(a, b) ** 0.5), a, b)
+
+    best_a = hull_xy[0]
+    best_b = hull_xy[1]
+    best_distance_sq = _distance_sq_xy(best_a, best_b)
+    j = 1
+    for i in range(point_count):
+        next_i = (i + 1) % point_count
+        while True:
+            next_j = (j + 1) % point_count
+            current_area = abs(_cross_xy(hull_xy[i], hull_xy[next_i], hull_xy[j]))
+            next_area = abs(_cross_xy(hull_xy[i], hull_xy[next_i], hull_xy[next_j]))
+            if next_area <= current_area:
+                break
+            j = next_j
+
+        for a_index, b_index in ((i, j), (next_i, j)):
+            distance_sq = _distance_sq_xy(hull_xy[a_index], hull_xy[b_index])
+            if distance_sq > best_distance_sq:
+                best_distance_sq = distance_sq
+                best_a = hull_xy[a_index]
+                best_b = hull_xy[b_index]
+
+    return MaskCaliperResult(float(best_distance_sq ** 0.5), best_a, best_b)
+
+
+def mask_longest_caliper(binary: np.ndarray) -> MaskCaliperResult | None:
+    mask = np.asarray(binary, dtype=bool)
+    if mask.ndim != 2 or not bool(np.any(mask)):
+        return None
+    ys, xs = np.nonzero(mask)
+    points_xy = np.column_stack((xs, ys))
+    return longest_caliper_on_hull(convex_hull_xy(points_xy))
+
+
+def polygon_area_xy(points_xy: list[tuple[int, int]]) -> float:
+    if len(points_xy) < 3:
+        return 0.0
+    area_twice = 0
+    for index, point in enumerate(points_xy):
+        next_point = points_xy[(index + 1) % len(points_xy)]
+        area_twice += point[0] * next_point[1] - next_point[0] * point[1]
+    return abs(float(area_twice)) / 2.0
+
+
+def mask_convex_hull(binary: np.ndarray) -> MaskHullResult | None:
+    mask = np.asarray(binary, dtype=bool)
+    if mask.ndim != 2:
+        return None
+    area_px = int(np.count_nonzero(mask))
+    if area_px <= 0:
+        return None
+    ys, xs = np.nonzero(mask)
+    corners = np.vstack(
+        (
+            np.column_stack((xs, ys)),
+            np.column_stack((xs + 1, ys)),
+            np.column_stack((xs, ys + 1)),
+            np.column_stack((xs + 1, ys + 1)),
+        )
+    )
+    hull = convex_hull_xy(corners)
+    hull_area = polygon_area_xy(hull)
+    solidity = float(area_px) / hull_area if hull_area > 0 else None
+    return MaskHullResult(hull, float(hull_area), int(area_px), solidity)
+
+
+def mask_ellipse_fit(binary: np.ndarray) -> MaskEllipseResult | None:
+    mask = np.asarray(binary, dtype=bool)
+    if mask.ndim != 2 or not bool(np.any(mask)):
+        return None
+    ys, xs = np.nonzero(mask)
+    points = np.column_stack((xs.astype(np.float64) + 0.5, ys.astype(np.float64) + 0.5))
+    center = np.mean(points, axis=0)
+    if points.shape[0] == 1:
+        return MaskEllipseResult(
+            (float(center[0]), float(center[1])),
+            1.0,
+            1.0,
+            0.0,
+            float(math.pi * 0.25),
+            0.0,
+        )
+
+    centered = points - center
+    covariance = np.cov(centered, rowvar=False, bias=True)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = np.maximum(eigenvalues[order], 0.0)
+    eigenvectors = eigenvectors[:, order]
+    major = max(1.0, 4.0 * float(math.sqrt(float(eigenvalues[0]))))
+    minor = max(1.0, 4.0 * float(math.sqrt(float(eigenvalues[1]))))
+    if minor > major:
+        major, minor = minor, major
+    major_vector = eigenvectors[:, 0]
+    angle_degrees = float(math.degrees(math.atan2(float(major_vector[1]), float(major_vector[0]))))
+    area = float(math.pi * (major / 2.0) * (minor / 2.0))
+    eccentricity = 0.0
+    if major > 0:
+        ratio = min(1.0, max(0.0, minor / major))
+        eccentricity = float(math.sqrt(max(0.0, 1.0 - ratio * ratio)))
+    return MaskEllipseResult(
+        (float(center[0]), float(center[1])),
+        float(major),
+        float(minor),
+        angle_degrees,
+        area,
+        eccentricity,
+    )
+
+
 def mask_metadata_fields(mask: np.ndarray, threshold: float) -> dict[str, Any]:
     mask_float = np.asarray(mask, dtype=np.float32)
     binary = np.asarray(mask_float > float(threshold))
@@ -360,6 +548,11 @@ def build_annotation_payload(
         total_mask_area_px += int(area_px)
         md["mask_area_px"] = int(area_px)
         md["mask_bbox_xyxy"] = bbox_xyxy
+        caliper = mask_longest_caliper(binary)
+        if caliper is not None:
+            md["caliper_distance_px"] = float(caliper.distance_px)
+            md["caliper_point_a_xy"] = [int(caliper.point_a_xy[0]), int(caliper.point_a_xy[1])]
+            md["caliper_point_b_xy"] = [int(caliper.point_b_xy[0]), int(caliper.point_b_xy[1])]
         md["stored_mask_values_are_binary"] = True
         md["stored_mask_values_kind"] = "thresholded_binary"
         md["ignore_regions_applied"] = int(len(ignore_masks))

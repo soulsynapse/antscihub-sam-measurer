@@ -144,8 +144,10 @@ image:
 
 - `<image-stem>.scale_bar_config.result.json`
 
-If the source folder already contains any `*.scale_bar_config.result.json` file,
-the scale-bar helper stops with an error instead of creating another config.
+If the source folder already contains a `*.scale_bar_config.result.json` file,
+the scale-bar helper opens the matching reference image and preloads its saved
+points, known length, and unit. If multiple configs are present, it tries the
+newest valid config first.
 
 The JSON includes:
 

@@ -190,31 +190,79 @@ def collect_image_candidates(source_dir: Path, patterns: list[str]) -> list[Path
 
 def find_existing_scale_bar_configs(source_dir: Path) -> list[Path]:
     return sorted(
-        path.resolve()
-        for path in source_dir.glob(f"*{SCALE_BAR_CONFIG_SUFFIX}")
-        if path.is_file()
+        (
+            path.resolve()
+            for path in source_dir.glob(f"*{SCALE_BAR_CONFIG_SUFFIX}")
+            if path.is_file()
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
     )
 
 
-def ensure_no_existing_scale_bar_config(source_dir: Path) -> None:
-    existing_configs = find_existing_scale_bar_configs(source_dir)
-    if not existing_configs:
-        return
+def image_path_from_existing_scale_bar_config(
+    config_path: Path,
+    source_dir: Path,
+    available_images: list[Path],
+) -> Path | None:
+    try:
+        payload = load_json_object(config_path)
+    except Exception:
+        return None
 
-    shown_names = ", ".join(path.name for path in existing_configs[:5])
-    if len(existing_configs) > 5:
-        shown_names = f"{shown_names}, ... ({len(existing_configs)} total)"
-    raise RuntimeError(
-        "Source folder already has a scale-bar config file. Remove or move the "
-        f"existing config before running scale_bar_config: {source_dir} "
-        f"({shown_names})"
-    )
+    image_by_key = {str(path.resolve()).lower(): path.resolve() for path in available_images}
+    image_by_name = {path.name: path.resolve() for path in available_images}
+    image_by_stem = {path.stem: path.resolve() for path in available_images}
+
+    selected_image_path = str(payload.get("selected_image_path") or "").strip()
+    if selected_image_path:
+        try:
+            candidate = Path(selected_image_path).expanduser().resolve()
+        except Exception:
+            candidate = source_dir / selected_image_path
+        if candidate.is_file() and candidate.suffix.lower() in IMAGE_SUFFIXES:
+            matched_image = image_by_key.get(str(candidate.resolve()).lower())
+            if matched_image is not None:
+                return matched_image
+
+    selected_image_name = str(payload.get("selected_image_name") or "").strip()
+    if selected_image_name and selected_image_name in image_by_name:
+        return image_by_name[selected_image_name]
+
+    suffix_len = len(SCALE_BAR_CONFIG_SUFFIX)
+    if config_path.name.endswith(SCALE_BAR_CONFIG_SUFFIX):
+        config_stem = config_path.name[:-suffix_len]
+        if config_stem in image_by_stem:
+            return image_by_stem[config_stem]
+
+    return None
+
+
+def find_existing_scale_bar_config_for_image(
+    source_dir: Path,
+    image_path: Path,
+    available_images: list[Path],
+) -> Path | None:
+    image_key = str(image_path.resolve()).lower()
+    direct_candidate = image_path.with_name(f"{image_path.stem}{SCALE_BAR_CONFIG_SUFFIX}")
+    if direct_candidate.is_file():
+        return direct_candidate.resolve()
+
+    for config_path in find_existing_scale_bar_configs(source_dir):
+        config_image = image_path_from_existing_scale_bar_config(
+            config_path,
+            source_dir,
+            available_images,
+        )
+        if config_image is not None and str(config_image.resolve()).lower() == image_key:
+            return config_path
+    return None
 
 
 def resolve_reference_and_applicability(
     source_input: Path,
     params: dict[str, Any],
-) -> tuple[Path, list[Path], Path | None]:
+) -> tuple[Path, list[Path], Path | None, Path | None]:
     patterns = parse_glob_patterns(as_str(params, "image_glob", IMAGE_GLOBS_DEFAULT))
 
     if source_input.is_file():
@@ -224,25 +272,42 @@ def resolve_reference_and_applicability(
             )
         resolved_file = source_input.resolve()
         folder_path = resolved_file.parent.resolve()
-        ensure_no_existing_scale_bar_config(folder_path)
         applicable_images = collect_image_candidates(folder_path, patterns)
         if not applicable_images:
             applicable_images = [resolved_file]
-        return resolved_file, applicable_images, folder_path
+        existing_config = find_existing_scale_bar_config_for_image(
+            folder_path,
+            resolved_file,
+            applicable_images,
+        )
+        return resolved_file, applicable_images, folder_path, existing_config
 
     if not source_input.is_dir():
         raise RuntimeError(f"Source input must be an image file or a directory: {source_input}")
 
     resolved_dir = source_input.resolve()
-    ensure_no_existing_scale_bar_config(resolved_dir)
     images = collect_image_candidates(resolved_dir, patterns)
     if not images:
         raise RuntimeError(f"No images found in directory: {source_input}")
 
+    for existing_config in find_existing_scale_bar_configs(resolved_dir):
+        existing_image = image_path_from_existing_scale_bar_config(
+            existing_config,
+            resolved_dir,
+            images,
+        )
+        if existing_image is not None:
+            return existing_image, images, resolved_dir, existing_config
+
     image_index = max(0, as_int(params, "image_index", 0))
     if image_index >= len(images):
         image_index = len(images) - 1
-    return images[image_index], images, resolved_dir
+    existing_config = find_existing_scale_bar_config_for_image(
+        resolved_dir,
+        images[image_index],
+        images,
+    )
+    return images[image_index], images, resolved_dir, existing_config
 
 
 def parse_point_value(raw: Any, key_name: str) -> tuple[float, float]:
@@ -420,12 +485,17 @@ def parse_scale_bar_preload_payload(
         return None
 
     selected_image = str(payload.get("selected_image_path") or "").strip()
+    selected_image_name = str(payload.get("selected_image_name") or "").strip()
     if selected_image:
         try:
-            if Path(selected_image).expanduser().resolve() != image_path.resolve():
+            selected_path = Path(selected_image).expanduser().resolve()
+            if selected_path != image_path.resolve() and selected_image_name != image_path.name:
                 return None
         except Exception:
-            return None
+            if selected_image_name != image_path.name:
+                return None
+    elif selected_image_name and selected_image_name != image_path.name:
+        return None
 
     scale_bar = payload.get("scale_bar")
     if not isinstance(scale_bar, dict):
@@ -504,7 +574,7 @@ def launch_gui(initial_source_input: Path | None, params: dict[str, Any], existi
     else:
         source_input = source_input.expanduser().resolve()
 
-    image_path, applicable_image_paths, applies_to_folder = resolve_reference_and_applicability(
+    image_path, applicable_image_paths, applies_to_folder, existing_config_path = resolve_reference_and_applicability(
         source_input,
         params,
     )
@@ -541,7 +611,11 @@ def launch_gui(initial_source_input: Path | None, params: dict[str, Any], existi
     preload_candidates: list[Path] = []
     if existing_result_path is not None:
         preload_candidates.append(existing_result_path)
+    if existing_config_path is not None:
+        preload_candidates.append(existing_config_path)
     preload_candidates.append(direct_output_path_for_image(image_path))
+    if applies_to_folder is not None:
+        preload_candidates.extend(find_existing_scale_bar_configs(applies_to_folder))
     preloaded_config = load_scale_bar_preload(image_path, original_size, preload_candidates)
 
     if preloaded_config is not None:
@@ -976,7 +1050,7 @@ def run_stage_for_runner(source_input: Path, params: dict[str, Any], output_resu
         raise RuntimeError("Headless mode requires params.known_length > 0.")
     length_unit = as_str(params, "length_unit", "mm").strip() or "mm"
 
-    image_path, applicable_image_paths, applies_to_folder = resolve_reference_and_applicability(
+    image_path, applicable_image_paths, applies_to_folder, _existing_config_path = resolve_reference_and_applicability(
         source_input,
         params,
     )
