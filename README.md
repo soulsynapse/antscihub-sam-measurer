@@ -144,6 +144,9 @@ image:
 
 - `<image-stem>.scale_bar_config.result.json`
 
+If the source folder already contains any `*.scale_bar_config.result.json` file,
+the scale-bar helper stops with an error instead of creating another config.
+
 The JSON includes:
 
 - selected image path and image size

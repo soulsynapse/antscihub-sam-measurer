@@ -11,6 +11,7 @@ from typing import Any
 
 IMAGE_GLOBS_DEFAULT = "*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tif;*.tiff"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+SCALE_BAR_CONFIG_SUFFIX = ".scale_bar_config.result.json"
 APPLIES_TO_PREVIEW_LIMIT_DEFAULT = 200
 
 
@@ -187,6 +188,29 @@ def collect_image_candidates(source_dir: Path, patterns: list[str]) -> list[Path
     return candidates
 
 
+def find_existing_scale_bar_configs(source_dir: Path) -> list[Path]:
+    return sorted(
+        path.resolve()
+        for path in source_dir.glob(f"*{SCALE_BAR_CONFIG_SUFFIX}")
+        if path.is_file()
+    )
+
+
+def ensure_no_existing_scale_bar_config(source_dir: Path) -> None:
+    existing_configs = find_existing_scale_bar_configs(source_dir)
+    if not existing_configs:
+        return
+
+    shown_names = ", ".join(path.name for path in existing_configs[:5])
+    if len(existing_configs) > 5:
+        shown_names = f"{shown_names}, ... ({len(existing_configs)} total)"
+    raise RuntimeError(
+        "Source folder already has a scale-bar config file. Remove or move the "
+        f"existing config before running scale_bar_config: {source_dir} "
+        f"({shown_names})"
+    )
+
+
 def resolve_reference_and_applicability(
     source_input: Path,
     params: dict[str, Any],
@@ -200,6 +224,7 @@ def resolve_reference_and_applicability(
             )
         resolved_file = source_input.resolve()
         folder_path = resolved_file.parent.resolve()
+        ensure_no_existing_scale_bar_config(folder_path)
         applicable_images = collect_image_candidates(folder_path, patterns)
         if not applicable_images:
             applicable_images = [resolved_file]
@@ -209,6 +234,7 @@ def resolve_reference_and_applicability(
         raise RuntimeError(f"Source input must be an image file or a directory: {source_input}")
 
     resolved_dir = source_input.resolve()
+    ensure_no_existing_scale_bar_config(resolved_dir)
     images = collect_image_candidates(resolved_dir, patterns)
     if not images:
         raise RuntimeError(f"No images found in directory: {source_input}")
