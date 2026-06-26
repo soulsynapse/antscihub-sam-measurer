@@ -30,6 +30,9 @@ EMBEDDING_FILE_SUFFIX = ".sam_embedding.npz"
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 MASK_OVERLAY_ALPHA = 0.62
 HOVER_MASK_OVERLAY_ALPHA = 0.45
+IGNORE_MASK_OVERLAY_ALPHA = 0.58
+IGNORE_MASK_OVERLAY_COLOR = (255, 35, 35)
+IGNORE_MASK_LABEL_COLOR = "#ff2323"
 MASK_OVERLAY_COLORS: tuple[tuple[int, int, int], ...] = (
     (0, 220, 255),
     (255, 190, 0),
@@ -439,6 +442,8 @@ class SamHoverMaskApp:
 
         self.last_mask: np.ndarray | None = None
         self.committed_masks: list[np.ndarray] = []
+        self.ignore_masks: list[np.ndarray] = []
+        self._ignore_mask_metadata: list[dict[str, Any]] = []
         self._committed_overlay_signature: tuple[Any, ...] | None = None
         self._committed_overlay_rgb: np.ndarray | None = None
         self._committed_overlay_base_weight: np.ndarray | None = None
@@ -1509,16 +1514,26 @@ class SamHoverMaskApp:
             return False
         return bool(np.all((arr == 0) | (arr == 1) | (arr == 255)))
 
-    def _threshold_for_committed_mask(self, idx: int, fallback: float) -> float:
-        md = self._session_metadata_for_mask_index(idx)
-        if self._metadata_marks_binary_mask(md):
+    @staticmethod
+    def _threshold_from_metadata(md: dict[str, Any], fallback: float) -> float:
+        if SamHoverMaskApp._metadata_marks_binary_mask(md):
             return 0.5
-
         for key in ("threshold_last_saved", "threshold_at_click"):
             parsed = parse_float_like(md.get(key))
             if parsed is not None:
                 return float(parsed)
         return float(fallback)
+
+    def _threshold_for_committed_mask(self, idx: int, fallback: float) -> float:
+        return self._threshold_from_metadata(
+            self._session_metadata_for_mask_index(idx),
+            fallback,
+        )
+
+    def _threshold_for_ignore_mask(self, idx: int, fallback: float) -> float:
+        metadata = getattr(self, "_ignore_mask_metadata", [])
+        md = metadata[idx] if 0 <= int(idx) < len(metadata) else {}
+        return self._threshold_from_metadata(md, fallback)
 
     def _thresholds_for_committed_masks(self, fallback: float) -> list[float]:
         return [
@@ -1526,14 +1541,64 @@ class SamHoverMaskApp:
             for idx in range(len(self.committed_masks))
         ]
 
+    def _thresholds_for_ignore_masks(self, fallback: float) -> list[float]:
+        return [
+            self._threshold_for_ignore_mask(idx, fallback)
+            for idx in range(len(getattr(self, "ignore_masks", [])))
+        ]
+
+    def _binary_ignore_mask_at_index(self, idx: int, fallback: float) -> np.ndarray:
+        mask = np.asarray(self.ignore_masks[idx], dtype=np.float32)
+        threshold = self._threshold_for_ignore_mask(idx, fallback)
+        return np.asarray(mask > threshold)
+
+    def _combined_ignore_mask(self, fallback: float) -> np.ndarray | None:
+        ignore_masks = getattr(self, "ignore_masks", [])
+        if not ignore_masks:
+            return None
+        combined: np.ndarray | None = None
+        for idx in range(len(ignore_masks)):
+            mask = self._binary_ignore_mask_at_index(idx, fallback)
+            if mask.ndim != 2:
+                continue
+            if combined is None:
+                combined = np.zeros(mask.shape, dtype=bool)
+            if combined.shape != mask.shape:
+                continue
+            combined |= mask
+        return combined
+
+    def _binary_mask_with_ignore(
+        self,
+        mask: np.ndarray,
+        threshold: float,
+        subtract_ignored: bool = True,
+    ) -> np.ndarray:
+        binary = np.asarray(np.asarray(mask, dtype=np.float32) > float(threshold))
+        if subtract_ignored:
+            ignore_mask = self._combined_ignore_mask(float(threshold))
+            if ignore_mask is not None and ignore_mask.shape == binary.shape:
+                binary = binary & (~ignore_mask)
+        return binary
+
     def _binary_committed_mask_at_index(self, idx: int, fallback: float) -> np.ndarray:
         mask = np.asarray(self.committed_masks[idx], dtype=np.float32)
         threshold = self._threshold_for_committed_mask(idx, fallback)
-        return np.asarray(mask > threshold)
+        return self._binary_mask_with_ignore(mask, threshold, subtract_ignored=True)
+
+    @staticmethod
+    def _mask_area_and_bbox(binary: np.ndarray) -> tuple[int, list[int] | None]:
+        mask = np.asarray(binary, dtype=bool)
+        area_px = int(np.count_nonzero(mask))
+        if area_px <= 0:
+            return 0, None
+        ys, xs = np.nonzero(mask)
+        return area_px, [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
 
     def _build_annotation_payload(self, saved_at: str) -> dict[str, Any]:
         h, w = self.image_np.shape[:2]
         sessions_by_index = self._sessions_by_mask_index()
+        threshold_for_export = float(self.mask_threshold_var.get())
 
         records: list[dict[str, Any]] = []
         total_mask_area_px = 0
@@ -1543,12 +1608,30 @@ class SamHoverMaskApp:
             md["session_id"] = sid
             md["mask_index"] = int(idx)
             md["last_updated_utc"] = md.get("last_updated_utc", saved_at)
-            area_px = md.get("mask_area_px")
-            if isinstance(area_px, (int, float)):
-                total_mask_area_px += int(area_px)
+            binary = self._binary_committed_mask_at_index(idx, threshold_for_export)
+            area_px, bbox_xyxy = self._mask_area_and_bbox(binary)
+            total_mask_area_px += int(area_px)
+            md["mask_area_px"] = int(area_px)
+            md["mask_bbox_xyxy"] = bbox_xyxy
             md["stored_mask_values_are_binary"] = True
             md["stored_mask_values_kind"] = "thresholded_binary"
+            md["ignore_regions_applied"] = int(len(getattr(self, "ignore_masks", [])))
             records.append(md)
+
+        ignore_records: list[dict[str, Any]] = []
+        ignore_total_mask_area_px = 0
+        for idx in range(len(getattr(self, "ignore_masks", []))):
+            md = dict(self._ignore_mask_metadata[idx]) if idx < len(self._ignore_mask_metadata) else {}
+            md["ignore_index"] = int(idx)
+            md["last_updated_utc"] = md.get("last_updated_utc", saved_at)
+            binary = self._binary_ignore_mask_at_index(idx, threshold_for_export)
+            area_px, bbox_xyxy = self._mask_area_and_bbox(binary)
+            ignore_total_mask_area_px += int(area_px)
+            md["mask_area_px"] = int(area_px)
+            md["mask_bbox_xyxy"] = bbox_xyxy
+            md["stored_mask_values_are_binary"] = True
+            md["stored_mask_values_kind"] = "thresholded_binary"
+            ignore_records.append(md)
 
         payload: dict[str, Any] = {
             "version": 1,
@@ -1561,8 +1644,11 @@ class SamHoverMaskApp:
             "continuous_mask_only": bool(self.continuous_mask_only_var.get()),
             "stored_mask_values_kind": "thresholded_binary",
             "mask_count": int(len(records)),
+            "ignore_mask_count": int(len(ignore_records)),
             "total_mask_area_px": int(total_mask_area_px),
+            "ignore_total_mask_area_px": int(ignore_total_mask_area_px),
             "records": records,
+            "ignore_records": ignore_records,
         }
         return payload
 
@@ -1572,38 +1658,71 @@ class SamHoverMaskApp:
         if save_path is None or self.image_np is None:
             return False
         try:
-            if not self.committed_masks:
+            if not self.committed_masks and not getattr(self, "ignore_masks", []):
                 if save_path.exists():
                     save_path.unlink()
                 if metadata_path is not None and metadata_path.exists():
                     metadata_path.unlink()
                 return True
 
+            h, w = self.image_np.shape[:2]
             threshold_for_export = float(self.mask_threshold_var.get())
             thresholds_for_export = self._thresholds_for_committed_masks(threshold_for_export)
-            binary_masks = np.stack(
-                [
-                    np.asarray(
-                        self._binary_committed_mask_at_index(idx, threshold_for_export),
-                        dtype=np.uint8,
-                    )
-                    for idx in range(len(self.committed_masks))
-                ],
-                axis=0,
-            )
+            ignore_thresholds_for_export = self._thresholds_for_ignore_masks(threshold_for_export)
+            if self.committed_masks:
+                binary_masks = np.stack(
+                    [
+                        np.asarray(
+                            self._binary_mask_with_ignore(
+                                self.committed_masks[idx],
+                                thresholds_for_export[idx],
+                                subtract_ignored=False,
+                            ),
+                            dtype=np.uint8,
+                        )
+                        for idx in range(len(self.committed_masks))
+                    ],
+                    axis=0,
+                )
+            else:
+                binary_masks = np.zeros((0, h, w), dtype=np.uint8)
+            if getattr(self, "ignore_masks", []):
+                ignore_binary_masks = np.stack(
+                    [
+                        np.asarray(
+                            self._binary_ignore_mask_at_index(idx, threshold_for_export),
+                            dtype=np.uint8,
+                        )
+                        for idx in range(len(self.ignore_masks))
+                    ],
+                    axis=0,
+                )
+            else:
+                ignore_binary_masks = np.zeros((0, h, w), dtype=np.uint8)
+
             packed_masks = np.packbits(binary_masks, axis=2, bitorder="little")
+            ignore_packed_masks = np.packbits(ignore_binary_masks, axis=2, bitorder="little")
             saved_at = self._utc_now_iso()
             payload = self._build_annotation_payload(saved_at=saved_at)
             payload["mask_encoding"] = "bitpack_binary_v1"
             payload["mask_threshold_mode"] = "per_mask"
             payload["mask_threshold_applied"] = threshold_for_export
             payload["mask_thresholds_applied"] = [float(value) for value in thresholds_for_export]
+            payload["ignore_mask_thresholds_applied"] = [
+                float(value) for value in ignore_thresholds_for_export
+            ]
             payload["mask_shape_nhw"] = [
                 int(binary_masks.shape[0]),
                 int(binary_masks.shape[1]),
                 int(binary_masks.shape[2]),
             ]
+            payload["ignore_mask_shape_nhw"] = [
+                int(ignore_binary_masks.shape[0]),
+                int(ignore_binary_masks.shape[1]),
+                int(ignore_binary_masks.shape[2]),
+            ]
             payload["packed_width_bytes"] = int(packed_masks.shape[2])
+            payload["ignore_packed_width_bytes"] = int(ignore_packed_masks.shape[2])
 
             save_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
@@ -1612,6 +1731,8 @@ class SamHoverMaskApp:
                     handle,
                     masks_packed=np.asarray(packed_masks, dtype=np.uint8),
                     masks_shape_nhw=np.asarray(binary_masks.shape, dtype=np.int32),
+                    ignore_masks_packed=np.asarray(ignore_packed_masks, dtype=np.uint8),
+                    ignore_masks_shape_nhw=np.asarray(ignore_binary_masks.shape, dtype=np.int32),
                     metadata_json=np.asarray(json.dumps(payload), dtype=np.str_),
                 )
             tmp_path.replace(save_path)
@@ -1627,58 +1748,104 @@ class SamHoverMaskApp:
         metadata_path = self._annotation_metadata_path()
         if save_path is None or self.image_np is None:
             self._session_metadata.clear()
+            self._ignore_mask_metadata.clear()
+            self.ignore_masks.clear()
             return 0
         if not save_path.exists():
             self._session_metadata.clear()
+            self._ignore_mask_metadata.clear()
+            self.ignore_masks.clear()
             return 0
 
+        def unpack_packed_masks(
+            packed: np.ndarray,
+            shape_arr: np.ndarray,
+            label: str,
+        ) -> np.ndarray:
+            if packed.ndim != 3:
+                raise RuntimeError(f"unexpected {label} packed mask shape")
+            if shape_arr.size != 3:
+                raise RuntimeError(f"missing shape metadata for {label} packed masks")
+            n, mh, mw = (int(shape_arr[0]), int(shape_arr[1]), int(shape_arr[2]))
+            if n < 0 or mh <= 0 or mw <= 0:
+                raise RuntimeError(f"invalid saved {label} packed mask dimensions")
+            if n != int(packed.shape[0]) or mh != int(packed.shape[1]):
+                raise RuntimeError(f"{label} packed mask dimensions do not match shape metadata")
+            if mw > int(packed.shape[2]) * 8:
+                raise RuntimeError(f"{label} packed mask width metadata exceeds packed payload width")
+            return np.unpackbits(
+                packed,
+                axis=2,
+                count=mw,
+                bitorder="little",
+            ).astype(np.float32)
+
         loaded_masks_are_binary = False
+        loaded_ignore_masks_are_binary = False
         try:
             with np.load(save_path, allow_pickle=False) as data:
                 metadata_json = data["metadata_json"] if "metadata_json" in data.files else None
                 if "masks_packed" in data.files:
                     loaded_masks_are_binary = True
-                    masks_packed = np.asarray(data["masks_packed"], dtype=np.uint8)
-                    shape_arr = (
+                    masks = unpack_packed_masks(
+                        np.asarray(data["masks_packed"], dtype=np.uint8),
                         np.asarray(data["masks_shape_nhw"], dtype=np.int64).reshape(-1)
                         if "masks_shape_nhw" in data.files
-                        else np.asarray([], dtype=np.int64)
+                        else np.asarray([], dtype=np.int64),
+                        "saved",
                     )
-                    if masks_packed.ndim != 3:
-                        raise RuntimeError("unexpected packed mask shape")
-                    if shape_arr.size != 3:
-                        raise RuntimeError("missing masks_shape_nhw for packed masks")
-                    n, mh, mw = (int(shape_arr[0]), int(shape_arr[1]), int(shape_arr[2]))
-                    if n <= 0 or mh <= 0 or mw <= 0:
-                        raise RuntimeError("invalid saved packed mask dimensions")
-                    if n != int(masks_packed.shape[0]) or mh != int(masks_packed.shape[1]):
-                        raise RuntimeError("packed mask dimensions do not match shape metadata")
-                    if mw > int(masks_packed.shape[2]) * 8:
-                        raise RuntimeError("packed mask width metadata exceeds packed payload width")
-                    masks = np.unpackbits(
-                        masks_packed,
-                        axis=2,
-                        count=mw,
-                        bitorder="little",
-                    ).astype(np.float32)
                 elif "masks" in data.files:
                     masks = np.asarray(data["masks"])
                 else:
                     raise RuntimeError("saved annotations missing mask payload")
+
+                if "ignore_masks_packed" in data.files:
+                    loaded_ignore_masks_are_binary = True
+                    ignore_masks = unpack_packed_masks(
+                        np.asarray(data["ignore_masks_packed"], dtype=np.uint8),
+                        np.asarray(data["ignore_masks_shape_nhw"], dtype=np.int64).reshape(-1)
+                        if "ignore_masks_shape_nhw" in data.files
+                        else np.asarray([], dtype=np.int64),
+                        "ignore",
+                    )
+                elif "ignore_masks" in data.files:
+                    ignore_masks = np.asarray(data["ignore_masks"])
+                else:
+                    ignore_masks = np.zeros((0, 1, 1), dtype=np.float32)
         except Exception as exc:
             self.status_var.set(f"Warning: could not load saved annotations ({exc})")
             self._session_metadata.clear()
+            self._ignore_mask_metadata.clear()
+            self.ignore_masks.clear()
             return 0
 
         if masks.ndim != 3:
             self.status_var.set("Warning: saved annotations ignored (unexpected mask shape).")
             self._session_metadata.clear()
+            self._ignore_mask_metadata.clear()
+            self.ignore_masks.clear()
+            return 0
+        if ignore_masks.ndim != 3:
+            self.status_var.set("Warning: saved annotations ignored (unexpected ignore mask shape).")
+            self._session_metadata.clear()
+            self._ignore_mask_metadata.clear()
+            self.ignore_masks.clear()
             return 0
 
         h, w = self.image_np.shape[:2]
         if tuple(masks.shape[1:]) != (h, w):
             self.status_var.set("Saved annotations found, but size does not match this image.")
             self._session_metadata.clear()
+            self._ignore_mask_metadata.clear()
+            self.ignore_masks.clear()
+            return 0
+        if int(ignore_masks.shape[0]) == 0:
+            ignore_masks = np.zeros((0, h, w), dtype=np.float32)
+        elif tuple(ignore_masks.shape[1:]) != (h, w):
+            self.status_var.set("Saved ignore annotations found, but size does not match this image.")
+            self._session_metadata.clear()
+            self._ignore_mask_metadata.clear()
+            self.ignore_masks.clear()
             return 0
 
         payload: dict[str, Any] = {}
@@ -1701,9 +1868,19 @@ class SamHoverMaskApp:
         loaded_records = payload.get("records", [])
         if isinstance(loaded_records, list):
             records = loaded_records
+        ignore_records: list[Any] = []
+        loaded_ignore_records = payload.get("ignore_records", [])
+        if isinstance(loaded_ignore_records, list):
+            ignore_records = loaded_ignore_records
         payload_marks_binary = self._metadata_marks_binary_mask(payload)
         thresholds_applied_raw = payload.get("mask_thresholds_applied", [])
         thresholds_applied = thresholds_applied_raw if isinstance(thresholds_applied_raw, list) else []
+        ignore_thresholds_applied_raw = payload.get("ignore_mask_thresholds_applied", [])
+        ignore_thresholds_applied = (
+            ignore_thresholds_applied_raw
+            if isinstance(ignore_thresholds_applied_raw, list)
+            else []
+        )
 
         self.last_mask = None
         self.pos_points.clear()
@@ -1713,6 +1890,8 @@ class SamHoverMaskApp:
         self._hover_preview_mask = None
         self._auto_advance_session_id = None
         self.committed_masks.clear()
+        self.ignore_masks.clear()
+        self._ignore_mask_metadata.clear()
         self._session_to_mask_index.clear()
         self._session_metadata.clear()
 
@@ -1752,21 +1931,55 @@ class SamHoverMaskApp:
                 rec_data["mask_values_are_binary"] = True
                 rec_data["mask_values_kind"] = "thresholded_binary"
                 binary = np.asarray(masks[idx] > 0.5)
-                rec_data.setdefault("mask_area_px", int(np.count_nonzero(binary)))
-                if "mask_bbox_xyxy" not in rec_data and bool(np.any(binary)):
-                    ys, xs = np.nonzero(binary)
-                    rec_data["mask_bbox_xyxy"] = [
-                        int(xs.min()),
-                        int(ys.min()),
-                        int(xs.max()),
-                        int(ys.max()),
-                    ]
+                area_px, bbox_xyxy = self._mask_area_and_bbox(binary)
+                rec_data.setdefault("mask_area_px", int(area_px))
+                rec_data.setdefault("mask_bbox_xyxy", bbox_xyxy)
             else:
                 rec_data["mask_values_are_binary"] = False
                 rec_data.setdefault("mask_values_kind", "sam_logits")
 
             self._session_to_mask_index[int(session_id)] = int(idx)
             self._session_metadata[int(session_id)] = rec_data
+
+        for idx in range(int(ignore_masks.shape[0])):
+            self.ignore_masks.append(np.asarray(ignore_masks[idx], dtype=np.float32))
+            rec = (
+                ignore_records[idx]
+                if idx < len(ignore_records) and isinstance(ignore_records[idx], dict)
+                else {}
+            )
+            rec_data = dict(rec)
+            rec_data["ignore_index"] = int(idx)
+
+            threshold_applied = None
+            if idx < len(ignore_thresholds_applied):
+                threshold_applied = parse_float_like(ignore_thresholds_applied[idx])
+            if threshold_applied is None:
+                threshold_applied = parse_float_like(payload.get("mask_threshold_applied"))
+            if threshold_applied is None:
+                threshold_applied = parse_float_like(payload.get("mask_threshold"))
+            if threshold_applied is not None:
+                rec_data.setdefault("threshold_last_saved", float(threshold_applied))
+                rec_data.setdefault("threshold_at_click", float(threshold_applied))
+                rec_data.setdefault("threshold_applied_to_saved_mask", float(threshold_applied))
+
+            mask_values_are_binary = bool(
+                loaded_ignore_masks_are_binary
+                or payload_marks_binary
+                or self._metadata_marks_binary_mask(rec_data)
+                or self._array_values_are_binary(ignore_masks[idx])
+            )
+            if mask_values_are_binary:
+                rec_data["mask_values_are_binary"] = True
+                rec_data["mask_values_kind"] = "thresholded_binary"
+                binary = np.asarray(ignore_masks[idx] > 0.5)
+                area_px, bbox_xyxy = self._mask_area_and_bbox(binary)
+                rec_data.setdefault("mask_area_px", int(area_px))
+                rec_data.setdefault("mask_bbox_xyxy", bbox_xyxy)
+            else:
+                rec_data["mask_values_are_binary"] = False
+                rec_data.setdefault("mask_values_kind", "sam_logits")
+            self._ignore_mask_metadata.append(rec_data)
 
         max_session = max(self._session_to_mask_index.keys(), default=0)
         self._active_session_id = int(max_session + 1) if max_session > 0 else 0
@@ -1822,9 +2035,16 @@ class SamHoverMaskApp:
         disp_y = float(np.clip(self.view_y + y, 0.0, dh - 1))
         return disp_x * iw / dw, disp_y * ih / dh
 
+    @staticmethod
+    def _event_ctrl_down(event: tk.Event) -> bool:
+        return bool(int(getattr(event, "state", 0) or 0) & 0x0004)
+
     def _on_left_click(self, event: tk.Event) -> None:
         p = self._to_image_coords(event.x, event.y)
         if p is None:
+            return
+        if self._event_ctrl_down(event):
+            self._add_ignore_mask_at_point(p)
             return
         # Left click seeds the current object session and auto-advances to
         # the next session once this click's prediction has been accepted.
@@ -1854,6 +2074,23 @@ class SamHoverMaskApp:
 
     def _on_right_click(self, event: tk.Event) -> None:
         if self.image_np is None:
+            return
+        if self._event_ctrl_down(event):
+            image_pt = self._to_image_coords(float(event.x), float(event.y))
+            removed_ignores = 0
+            if image_pt is not None:
+                removed_ignores = self._remove_ignore_masks_near_image(
+                    image_center=image_pt,
+                    radius_image_px=self._display_radius_to_image_radius(
+                        self._erase_radius_display_px
+                    ),
+                )
+            if removed_ignores > 0:
+                self._save_annotations_for_current_image()
+                self._render()
+                self.status_var.set(f"Removed {removed_ignores} ignored region(s).")
+            else:
+                self.status_var.set("No ignored region nearby.")
             return
         annotations_changed = False
         removed_points = self._remove_points_near_display(
@@ -1947,6 +2184,125 @@ class SamHoverMaskApp:
         points[:] = kept
         return removed
 
+    def _add_ignore_mask_at_point(self, point: tuple[float, float]) -> None:
+        if self.model is None or self.image_np is None:
+            self.status_var.set("Load an image/model before adding ignored regions.")
+            return
+        with self._predict_lock:
+            if self._predict_busy:
+                self.status_var.set("Busy predicting; try ignore click again in a moment.")
+                return
+            self._predict_busy = True
+
+        seed_point = (float(point[0]), float(point[1]))
+        threshold_at_click = float(self.mask_threshold_var.get())
+        continuous_at_click = bool(self.continuous_mask_only_var.get())
+        model = self.model
+
+        def worker() -> None:
+            try:
+                points = np.asarray([seed_point], dtype=np.float32)
+                labels = np.asarray([1], dtype=np.int32)
+                mask = model.predict_mask_from_points(points=points, point_labels=labels)
+                mask = self._stabilize_mask_for_seed(
+                    mask,
+                    seed_point=seed_point,
+                    trim_component=continuous_at_click,
+                )
+            except Exception as exc:
+                self.root.after(
+                    0,
+                    lambda: self._finish_ignore_prediction(
+                        seed_point,
+                        threshold_at_click,
+                        continuous_at_click,
+                        None,
+                        str(exc),
+                    ),
+                )
+                return
+            self.root.after(
+                0,
+                lambda: self._finish_ignore_prediction(
+                    seed_point,
+                    threshold_at_click,
+                    continuous_at_click,
+                    mask,
+                    None,
+                ),
+            )
+
+        self.status_var.set("Adding ignored region...")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_ignore_prediction(
+        self,
+        seed_point: tuple[float, float],
+        threshold_at_click: float,
+        continuous_at_click: bool,
+        mask: np.ndarray | None,
+        err: str | None,
+    ) -> None:
+        with self._predict_lock:
+            self._predict_busy = False
+        if err is not None:
+            self.status_var.set(f"Ignore warning: {err}")
+        elif mask is not None:
+            self.ignore_masks.append(mask.copy())
+            self._ignore_mask_metadata.append(
+                self._build_ignore_mask_metadata(
+                    ignore_index=len(self.ignore_masks) - 1,
+                    seed_point=seed_point,
+                    mask=mask,
+                    threshold=threshold_at_click,
+                    continuous_mask_only=continuous_at_click,
+                )
+            )
+            self._invalidate_committed_overlay_cache()
+            self._save_annotations_for_current_image()
+            self._render()
+            self.status_var.set(f"Added ignored region {len(self.ignore_masks)}.")
+        if self._pending_navigation_delta is not None:
+            self._dirty_preview = False
+            self.hover_point = None
+            self._hover_preview_mask = None
+            self.root.after(0, self._consume_pending_navigation)
+        elif self._dirty_preview:
+            self.root.after(8, self._run_preview)
+
+    def _build_ignore_mask_metadata(
+        self,
+        ignore_index: int,
+        seed_point: tuple[float, float],
+        mask: np.ndarray,
+        threshold: float,
+        continuous_mask_only: bool,
+    ) -> dict[str, Any]:
+        now = self._utc_now_iso()
+        h, w = self.image_np.shape[:2]
+        binary = np.asarray(np.asarray(mask, dtype=np.float32) > float(threshold))
+        area_px, bbox_xyxy = self._mask_area_and_bbox(binary)
+        return {
+            "kind": "ignore",
+            "ignore_index": int(ignore_index),
+            "seed_point_xy": [float(seed_point[0]), float(seed_point[1])],
+            "seed_point_xy_round": [int(round(seed_point[0])), int(round(seed_point[1]))],
+            "created_at_utc": now,
+            "last_updated_utc": now,
+            "image_size_hw": [int(h), int(w)],
+            "model_name": self.model_name_var.get().strip() or DEFAULT_MODEL_NAME,
+            "threshold_at_click": float(threshold),
+            "threshold_last_saved": float(threshold),
+            "continuous_mask_only_at_click": bool(continuous_mask_only),
+            "mask_values_are_binary": False,
+            "mask_values_kind": "sam_logits",
+            "mask_area_px": int(area_px),
+            "mask_bbox_xyxy": bbox_xyxy,
+            "mask_logit_min": float(np.min(mask)),
+            "mask_logit_max": float(np.max(mask)),
+            "mask_logit_mean": float(np.mean(mask)),
+        }
+
     def _display_radius_to_image_radius(self, radius_display_px: float) -> float:
         if self.image_np is None:
             return float(radius_display_px)
@@ -1993,6 +2349,50 @@ class SamHoverMaskApp:
                     removed += 1
         return removed
 
+    def _remove_ignore_masks_near_image(
+        self, image_center: tuple[float, float], radius_image_px: float
+    ) -> int:
+        if not getattr(self, "ignore_masks", []):
+            return 0
+        fallback_threshold = float(self.mask_threshold_var.get())
+        cx = int(round(float(image_center[0])))
+        cy = int(round(float(image_center[1])))
+        if self.image_np is None:
+            return 0
+        h, w = self.image_np.shape[:2]
+        cx = int(np.clip(cx, 0, max(0, w - 1)))
+        cy = int(np.clip(cy, 0, max(0, h - 1)))
+
+        r = max(1, int(round(float(radius_image_px))))
+        x0 = max(0, cx - r)
+        x1 = min(w, cx + r + 1)
+        y0 = max(0, cy - r)
+        y1 = min(h, cy + r + 1)
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        disk = (xx - cx) ** 2 + (yy - cy) ** 2 <= float(r * r)
+
+        removed = 0
+        for idx in range(len(self.ignore_masks) - 1, -1, -1):
+            mask = self._binary_ignore_mask_at_index(idx, fallback_threshold)
+            region = mask[y0:y1, x0:x1]
+            if region.shape != disk.shape:
+                continue
+            if bool(np.any(region[disk])):
+                if self._remove_ignore_mask_at_index(idx):
+                    removed += 1
+        return removed
+
+    def _remove_ignore_mask_at_index(self, idx: int) -> bool:
+        if idx < 0 or idx >= len(getattr(self, "ignore_masks", [])):
+            return False
+        self.ignore_masks.pop(idx)
+        if idx < len(self._ignore_mask_metadata):
+            self._ignore_mask_metadata.pop(idx)
+        for new_idx, md in enumerate(self._ignore_mask_metadata):
+            md["ignore_index"] = int(new_idx)
+        self._invalidate_committed_overlay_cache()
+        return True
+
     def _on_mouse_move(self, event: tk.Event) -> None:
         if self._middle_pan_last_canvas_xy is not None:
             return
@@ -2025,6 +2425,8 @@ class SamHoverMaskApp:
         if reset_mask:
             self.last_mask = None
             self.committed_masks.clear()
+            self.ignore_masks.clear()
+            self._ignore_mask_metadata.clear()
             self._invalidate_committed_overlay_cache()
             self._session_to_mask_index.clear()
             self._session_metadata.clear()
@@ -2310,6 +2712,21 @@ class SamHoverMaskApp:
                     continue
         return points
 
+    def _get_ignore_click_points_in_order(
+        self,
+    ) -> list[tuple[int, tuple[float, float]]]:
+        points: list[tuple[int, tuple[float, float]]] = []
+        for idx, md in enumerate(getattr(self, "_ignore_mask_metadata", [])):
+            seed = md.get("seed_point_xy")
+            if isinstance(seed, (list, tuple)) and len(seed) >= 2:
+                try:
+                    px = float(seed[0])
+                    py = float(seed[1])
+                    points.append((idx + 1, (px, py)))
+                except Exception:
+                    continue
+        return points
+
     def _render(self) -> None:
         if self.display_base_np is None:
             self.canvas.delete("all")
@@ -2418,23 +2835,55 @@ class SamHoverMaskApp:
                 anchor=tk.CENTER,
             )
 
+        for _num, pt in self._get_ignore_click_points_in_order():
+            canvas_pt = self._image_point_to_canvas(pt)
+            if canvas_pt is None:
+                continue
+            cx, cy = canvas_pt
+            if cx < 0 or cy < 0 or cx >= canvas_w or cy >= canvas_h:
+                continue
+            x = int(round(cx))
+            y = int(round(cy))
+            for ox, oy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                self.canvas.create_text(
+                    x + ox,
+                    y + oy,
+                    text="X",
+                    fill="#111111",
+                    font=("TkDefaultFont", 11, "bold"),
+                    anchor=tk.CENTER,
+                )
+            self.canvas.create_text(
+                x,
+                y,
+                text="X",
+                fill=IGNORE_MASK_LABEL_COLOR,
+                font=("TkDefaultFont", 11, "bold"),
+                anchor=tk.CENTER,
+            )
+
     def _invalidate_committed_overlay_cache(self) -> None:
         self._committed_overlay_signature = None
         self._committed_overlay_rgb = None
         self._committed_overlay_base_weight = None
 
     def _committed_overlay_cache_signature(
-        self, thresholds: list[float]
+        self,
+        thresholds: list[float],
+        ignore_thresholds: list[float],
     ) -> tuple[Any, ...]:
         return (
             self.display_size,
             tuple(float(value) for value in thresholds),
+            tuple(float(value) for value in ignore_thresholds),
             tuple(id(mask) for mask in self.committed_masks),
+            tuple(id(mask) for mask in getattr(self, "ignore_masks", [])),
         )
 
     def _ensure_committed_overlay_cache(self, threshold: float) -> None:
         thresholds = self._thresholds_for_committed_masks(threshold)
-        signature = self._committed_overlay_cache_signature(thresholds)
+        ignore_thresholds = self._thresholds_for_ignore_masks(threshold)
+        signature = self._committed_overlay_cache_signature(thresholds, ignore_thresholds)
         if (
             self._committed_overlay_signature == signature
             and self._committed_overlay_rgb is not None
@@ -2442,7 +2891,7 @@ class SamHoverMaskApp:
         ):
             return
 
-        if not self.committed_masks:
+        if not self.committed_masks and not getattr(self, "ignore_masks", []):
             self._committed_overlay_signature = signature
             self._committed_overlay_rgb = None
             self._committed_overlay_base_weight = None
@@ -2465,6 +2914,24 @@ class SamHoverMaskApp:
             color_arr = np.asarray(self._mask_color_for_index(idx), dtype=np.float32)
             overlay_rgb[mask_display] = keep_base * overlay_rgb[mask_display] + alpha * color_arr
             base_weight[mask_display] *= keep_base
+
+        ignore_alpha = float(IGNORE_MASK_OVERLAY_ALPHA)
+        ignore_keep_base = 1.0 - ignore_alpha
+        ignore_color_arr = np.asarray(IGNORE_MASK_OVERLAY_COLOR, dtype=np.float32)
+        for idx in range(len(getattr(self, "ignore_masks", []))):
+            mask_arr = self._binary_ignore_mask_at_index(idx, threshold)
+            if mask_arr.ndim != 2:
+                continue
+            mask_img = Image.fromarray((mask_arr.astype(np.uint8) * 255), mode="L")
+            mask_img = mask_img.resize(self.display_size, Image.Resampling.NEAREST)
+            mask_display = np.asarray(mask_img) > 0
+            if not bool(np.any(mask_display)):
+                continue
+            overlay_rgb[mask_display] = (
+                ignore_keep_base * overlay_rgb[mask_display]
+                + ignore_alpha * ignore_color_arr
+            )
+            base_weight[mask_display] *= ignore_keep_base
 
         self._committed_overlay_signature = signature
         self._committed_overlay_rgb = overlay_rgb
@@ -2529,8 +2996,9 @@ class SamHoverMaskApp:
         crop_box: tuple[int, int, int, int],
         color: tuple[int, int, int],
         alpha: float,
+        subtract_ignored: bool = True,
     ) -> None:
-        mask_arr = np.asarray(mask > threshold)
+        mask_arr = self._binary_mask_with_ignore(mask, threshold, subtract_ignored=subtract_ignored)
         if mask_arr.ndim != 2:
             return
         mask_img = Image.fromarray((mask_arr.astype(np.uint8) * 255), mode="L")
@@ -2552,8 +3020,9 @@ class SamHoverMaskApp:
         threshold: float,
         crop_box: tuple[int, int, int, int],
         color: tuple[int, int, int],
+        subtract_ignored: bool = True,
     ) -> None:
-        mask_arr = np.asarray(mask > threshold)
+        mask_arr = self._binary_mask_with_ignore(mask, threshold, subtract_ignored=subtract_ignored)
         if mask_arr.ndim != 2:
             return
         mask_img = Image.fromarray((mask_arr.astype(np.uint8) * 255), mode="L")

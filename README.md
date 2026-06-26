@@ -52,7 +52,9 @@ Lightweight desktop GUI to measure things using SAM.
 - Loads an image.
 - Supports positive prompts and point erasing:
   - Left click: seed (or reseed) the current object
+  - Ctrl + left click: add an ignored region that is subtracted from masks
   - Right click: remove point(s) or committed mask(s) near the cursor
+  - Ctrl + right click: remove ignored region(s) near the cursor
   - Mouse hover: temporary positive point for live preview
 - Shows a live mask overlay as you move the mouse.
 - Can keep masks continuous by retaining only the component connected to the click.
@@ -94,10 +96,10 @@ ONNX weights are stored in `antscihub-sam-measurer/models/`.
 SAM annotation files are saved next to the image being annotated:
 
 - `<image>.sam_clicks.npz`: compressed binary masks, stored as bit-packed mask arrays.
-  Each mask is packed using that click's saved threshold.
+  Each mask is packed using that click's saved threshold; ignored regions are packed separately and subtracted by the GUI and metadata.
 - `<image>.sam_clicks.json`: readable metadata with image size, model name, threshold,
-  mask count, total mask area in pixels, and per-mask seed point, bbox, area, and
-  logit stats.
+  mask count, ignore-mask count, total mask area in pixels, and per-mask seed point,
+  bbox, area, and logit stats.
 - `<image>.<hash>.sam_embedding.npz`: cached SAM embedding for faster reopening.
 
 Runner mode also writes its configured result JSON, typically named like:
@@ -177,10 +179,13 @@ JSON, the annotation JSON, and each per-click record.
 ## Controls
 
 - `Left click`: seed/reseed current object
+- `Ctrl` + `Left click`: add an ignored region that is subtracted from masks
 - `Right click`: remove nearby point(s) and/or committed mask(s)
-- `Mouse wheel`: pan vertically while zoomed
+- `Ctrl` + `Right click`: remove nearby ignored region(s)
+- `Mouse wheel`: adjust mask threshold
 - `Shift` + `Mouse wheel`: pan horizontally while zoomed
 - `Ctrl` + `Mouse wheel`: zoom around the cursor
+- `Middle mouse drag`: pan around while zoomed
 - `n`: start a new object
 - `c`: clear prompts
 
