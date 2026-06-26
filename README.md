@@ -20,41 +20,56 @@ TODO: Add a video of the workflow.
 ## Current features:
 
 **Mask GUI**
-* Click-to-segment — left click runs SAM and commits a mask; right click removes nearby masks or points.
-* Live hover preview — the mask preview follows the mouse before you click.
-* Multiple masks per image — `n` starts a new object; each gets its own record.
-* Ignored regions — `Ctrl`+click marks areas that are subtracted from all masks; `Ctrl`+right-click removes them.
-* Continuous mask mode — retains only the connected component touching the click point, which cuts out stray patches.
-* Selection outline — optional 1-pixel outline around the active mask; color is selectable from a dropdown.
-* Mask sensitivity — mouse wheel adjusts the logit threshold live.
-* Zoom and pan — `Ctrl`+wheel to zoom around the cursor, middle-mouse drag to pan, `Shift`+wheel to pan horizontally.
-* Folder navigation — Prev/Next buttons and arrow/A/D/Space keys to step through all images in a folder.
-* Four SAM model variants — accuracy (ViT-H, default), balanced, speed, and EdgeSAM; selected from a dropdown.
-* Auto-download — missing ONNX weights are fetched automatically on first use.
-* Autosave — every committed mask is immediately written to `.sam_clicks.json` and `.sam_clicks.npz` next to the image.
-* Embedding cache — SAM image embeddings are cached to `.sam_embedding.npz` so reopening an image is fast.
+
+| Feature | Description |
+|---|---|
+| Click-to-segment | Left click runs SAM and commits a mask; right click removes nearby masks or points. |
+| Live hover preview | The mask preview follows the mouse before you click. |
+| Multiple masks per image | `n` starts a new object; each gets its own record. |
+| Ignored regions | `Ctrl`+click marks areas that are subtracted from all masks; `Ctrl`+right-click removes them. |
+| Continuous mask mode | Retains only the connected component touching the click point, cutting out stray patches. |
+| Selection outline | Optional 1-pixel outline around the active mask; color is selectable from a dropdown. |
+| Mask sensitivity | Mouse wheel adjusts the logit threshold live. |
+| Zoom and pan | `Ctrl`+wheel to zoom around the cursor, middle-mouse drag to pan, `Shift`+wheel to pan horizontally. |
+| Folder navigation | Prev/Next buttons and arrow/A/D/Space keys to step through all images in a folder. |
+| Model selection | Four SAM variants: accuracy (ViT-H, default), balanced, speed, and EdgeSAM; picked from a dropdown. |
+| Auto-download | Missing ONNX weights are fetched automatically on first use. |
+| Autosave | Every committed mask is immediately written to `.sam_clicks.json` and `.sam_clicks.npz` next to the image. |
+| Embedding cache | SAM image embeddings are cached to `.sam_embedding.npz` so reopening an image is fast. |
 
 **QC tool**
-* Browse an annotated folder and step through every individual mask.
-* Cropped, zoomed preview of each masked subject at its bounding box.
-* Scrollable stats sidebar showing a mask summary card and all raw metadata fields.
-* Real-world area displayed when a scale-bar config is present in the folder.
-* Color-selectable outline on the preview; keyboard navigation with arrow keys, A/D.
+
+| Feature | Description |
+|---|---|
+| Folder browsing | Browse an annotated folder and step through every individual mask. |
+| Subject preview | Cropped, zoomed view of each masked subject at its bounding box. |
+| Stats sidebar | Scrollable panel showing a mask summary card and all raw metadata fields. |
+| Scale-derived values | Real-world area shown when a scale-bar config is present in the folder. |
+| Navigation | Color-selectable outline on the preview; keyboard navigation with arrow keys, A/D. |
 
 **Scale bar config**
-* Click two endpoints on a reference scale bar, enter the known length and unit, press Accept.
-* Preloads an existing config from the folder so re-editing is non-destructive.
-* Saves a single calibration JSON that covers the whole image folder.
+
+| Feature | Description |
+|---|---|
+| Point-and-click calibration | Click two endpoints on a reference scale bar, enter the known length and unit, press Accept. |
+| Config preload | Preloads an existing config from the folder so re-editing is non-destructive. |
+| Folder scope | One calibration JSON covers all images in the folder. |
 
 **Batch embedding precompute**
-* Recursively walks a folder tree and precomputes SAM embeddings for every image.
-* Skips images that already have a fresh cache; downloads the selected model if needed.
-* `--force` flag to recompute everything; optional `--summary-json` output.
+
+| Feature | Description |
+|---|---|
+| Recursive precompute | Walks a folder tree and precomputes SAM embeddings for every image. |
+| Smart skipping | Skips images with a fresh cache; downloads the selected model if needed. |
+| CLI options | `--force` to recompute everything; `--summary-json` for a summary output file. |
 
 **CSV export**
-* Reads the folder's scale-bar config and all annotation JSONs, then writes `sam_mask_measurements.csv`.
-* Measurement columns first: image name, mask number, pixel area, `units_per_pixel`, computed area and unit.
-* Full flattened metadata appended as additional columns for filtering in a spreadsheet.
+
+| Feature | Description |
+|---|---|
+| Folder export | Reads the scale-bar config and all annotation JSONs, writes `sam_mask_measurements.csv`. |
+| Measurement columns | Image name, mask number, pixel area, `units_per_pixel`, computed area and unit listed first. |
+| Full metadata | All annotation metadata appended as extra columns for filtering in a spreadsheet. |
 
 ## Future features, or the to-do:
 
@@ -108,13 +123,13 @@ Once you have it in vscode, you can click any file and click the play button and
 
 ## Typical Workflow
 
-1. **Calibrate** — Run `scale_bar_config.py` on the image that contains your scale bar. Click the two ends, enter the known length and unit, and press `Accept`. One config file covers the whole folder. Current logic for 
+1. **Calibrate**: Run `scale_bar_config.py` on the image that contains your scale bar. Click the two ends, enter the known length and unit, and press `Accept`. One config file covers the whole folder. Current logic for 
 
-2. **Precompute** (optional, recommended for large batches) — Run `precompute_embeddings.py` on your image folder to cache SAM embeddings before you start clicking.
+2. **Precompute** (optional, recommended for large batches): Run `precompute_embeddings.py` on your image folder to cache SAM embeddings before you start clicking.
 
-3. **Annotate** — Open `sam_hover_mask_gui.py`, load each image, and click objects to create and save masks.
+3. **Annotate**: Open `sam_hover_mask_gui.py`, load each image, and click objects to create and save masks.
 
-4. **Export** — Run `folder-to-csv.py` on the folder to combine the scale calibration with all saved mask data into one CSV.
+4. **Export**: Run `folder-to-csv.py` on the folder to combine the scale calibration with all saved mask data into one CSV.
 
 ## Run the Mask GUI
 
