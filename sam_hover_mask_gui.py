@@ -28,6 +28,28 @@ ANNOTATION_FILE_SUFFIX = ".sam_clicks.npz"
 ANNOTATION_METADATA_FILE_SUFFIX = ".sam_clicks.json"
 EMBEDDING_FILE_SUFFIX = ".sam_embedding.npz"
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+MASK_OVERLAY_ALPHA = 0.62
+HOVER_MASK_OVERLAY_ALPHA = 0.45
+MASK_OVERLAY_COLORS: tuple[tuple[int, int, int], ...] = (
+    (0, 220, 255),
+    (255, 190, 0),
+    (255, 80, 200),
+    (90, 230, 80),
+    (255, 120, 50),
+    (160, 150, 255),
+    (255, 70, 90),
+    (50, 210, 150),
+)
+OUTLINE_COLOR_CHOICES: tuple[tuple[str, tuple[int, int, int]], ...] = (
+    ("Neon cyan", (0, 255, 255)),
+    ("Neon lime", (80, 255, 0)),
+    ("Neon pink", (255, 45, 210)),
+    ("Neon yellow", (255, 255, 0)),
+    ("Neon orange", (255, 120, 0)),
+    ("Neon violet", (180, 80, 255)),
+)
+OUTLINE_COLOR_MAP = dict(OUTLINE_COLOR_CHOICES)
+DEFAULT_OUTLINE_COLOR_NAME = OUTLINE_COLOR_CHOICES[0][0]
 
 
 def parse_args() -> argparse.Namespace:
@@ -398,12 +420,16 @@ class SamHoverMaskApp:
         self._erase_radius_display_px = 16.0
         self.view_x = 0.0
         self.view_y = 0.0
+        self._middle_pan_last_canvas_xy: tuple[float, float] | None = None
 
         self.encoder_var = tk.StringVar()
         self.decoder_var = tk.StringVar()
         self.model_name_var = tk.StringVar(value=DEFAULT_MODEL_NAME)
         self.mask_threshold_var = tk.DoubleVar(value=0.0)
         self.mask_threshold_text_var = tk.StringVar(value="0.00")
+        self.continuous_mask_only_var = tk.BooleanVar(value=True)
+        self.selection_outline_var = tk.BooleanVar(value=True)
+        self.selection_outline_color_var = tk.StringVar(value=DEFAULT_OUTLINE_COLOR_NAME)
         self.status_var = tk.StringVar(value="Ready. Load an image.")
 
         self.pos_points: list[tuple[float, float]] = []
@@ -413,7 +439,10 @@ class SamHoverMaskApp:
 
         self.last_mask: np.ndarray | None = None
         self.committed_masks: list[np.ndarray] = []
-        self._seed_mask_cache: dict[tuple[int, int], np.ndarray] = {}
+        self._committed_overlay_signature: tuple[Any, ...] | None = None
+        self._committed_overlay_rgb: np.ndarray | None = None
+        self._committed_overlay_base_weight: np.ndarray | None = None
+        self._seed_mask_cache: dict[tuple[int, int, bool], np.ndarray] = {}
         self._active_session_id = 0
         self._auto_advance_session_id: int | None = None
         self._pending_navigation_delta: int | None = None
@@ -423,7 +452,6 @@ class SamHoverMaskApp:
         self._predict_busy = False
         self._dirty_preview = False
         self._request_id = 0
-        self._component_trim_limit = 12
         self._loaded_model_signature: tuple[str, str] | None = None
         self._folder_image_paths: list[Path] = []
         self._current_image_index = -1
@@ -431,6 +459,10 @@ class SamHoverMaskApp:
         self.prev_image_btn: tk.Button | None = None
         self.next_image_btn: tk.Button | None = None
         self.cache_all_btn: tk.Button | None = None
+        self.mask_threshold_label: tk.Label | None = None
+        self.mask_threshold_value_label: tk.Label | None = None
+        self._mask_threshold_default_bg = ""
+        self._mask_threshold_default_fg = ""
         self._startup_source_input = (
             initial_source_input.expanduser().resolve()
             if isinstance(initial_source_input, Path)
@@ -498,7 +530,8 @@ class SamHoverMaskApp:
 
         row4 = tk.Frame(top)
         row4.pack(fill=tk.X, pady=4)
-        tk.Label(row4, text="Mask threshold:").pack(side=tk.LEFT)
+        self.mask_threshold_label = tk.Label(row4, text="Mask threshold:")
+        self.mask_threshold_label.pack(side=tk.LEFT)
         tk.Scale(
             row4,
             from_=-20.0,
@@ -509,7 +542,39 @@ class SamHoverMaskApp:
             variable=self.mask_threshold_var,
             command=self._on_threshold_changed,
         ).pack(side=tk.LEFT, padx=6)
-        tk.Label(row4, textvariable=self.mask_threshold_text_var, width=6, anchor="w").pack(side=tk.LEFT)
+        self.mask_threshold_value_label = tk.Label(
+            row4,
+            textvariable=self.mask_threshold_text_var,
+            width=6,
+            anchor="w",
+        )
+        self.mask_threshold_value_label.pack(side=tk.LEFT)
+        self._mask_threshold_default_bg = str(self.mask_threshold_value_label.cget("bg"))
+        self._mask_threshold_default_fg = str(self.mask_threshold_value_label.cget("fg"))
+        self._sync_threshold_display()
+        tk.Button(row4, text="Reset threshold", command=self._reset_mask_threshold).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Checkbutton(
+            row4,
+            text="Continuous mask only",
+            variable=self.continuous_mask_only_var,
+            command=self._on_continuous_mask_only_changed,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        tk.Checkbutton(
+            row4,
+            text="Add outline",
+            variable=self.selection_outline_var,
+            command=self._on_selection_outline_changed,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        tk.Label(row4, text="Outline:").pack(side=tk.LEFT, padx=(8, 2))
+        self.outline_color_combo = ttk.Combobox(
+            row4,
+            textvariable=self.selection_outline_color_var,
+            values=[name for name, _color in OUTLINE_COLOR_CHOICES],
+            state="readonly",
+            width=12,
+        )
+        self.outline_color_combo.pack(side=tk.LEFT)
+        self.outline_color_combo.bind("<<ComboboxSelected>>", self._on_selection_outline_changed)
 
         self.canvas = tk.Canvas(self.root, bg="#222")
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -521,7 +586,12 @@ class SamHoverMaskApp:
         self.canvas.bind("<Leave>", self._on_mouse_leave)
         self.canvas.bind("<Button-1>", self._on_left_click)   # positive prompt
         self.canvas.bind("<Button-3>", self._on_right_click)  # erase nearby point(s)
+        self.canvas.bind("<ButtonPress-2>", self._on_middle_mouse_down)
+        self.canvas.bind("<B2-Motion>", self._on_middle_mouse_drag)
+        self.canvas.bind("<ButtonRelease-2>", self._on_middle_mouse_up)
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+        self.canvas.bind("<Button-4>", self._on_mouse_wheel)
+        self.canvas.bind("<Button-5>", self._on_mouse_wheel)
         self.root.bind("n", lambda _e: self._start_new_mask_session())
         self.root.bind("c", lambda _e: self._clear_prompts())
         self.root.bind("<Left>", lambda _e: self._navigate_prev_image())
@@ -594,7 +664,33 @@ class SamHoverMaskApp:
         if threshold is not None:
             threshold_clipped = float(np.clip(threshold, -20.0, 20.0))
             self.mask_threshold_var.set(threshold_clipped)
-            self.mask_threshold_text_var.set(f"{threshold_clipped:.2f}")
+            self._sync_threshold_display()
+
+        for key in ("continuous_mask_only", "connected_component_only"):
+            if key not in params:
+                continue
+            continuous = parse_bool_like(params.get(key))
+            if continuous is not None:
+                self.continuous_mask_only_var.set(bool(continuous))
+            break
+
+        for key in ("add_outline", "selection_outline", "mask_outline"):
+            if key not in params:
+                continue
+            add_outline = parse_bool_like(params.get(key))
+            if add_outline is not None:
+                self.selection_outline_var.set(bool(add_outline))
+            break
+
+        outline_color = str(
+            params.get("outline_color", params.get("selection_outline_color", ""))
+        ).strip()
+        if outline_color:
+            normalized = self._normalize_outline_color_name(outline_color)
+            if normalized is not None:
+                self.selection_outline_color_var.set(normalized)
+            else:
+                self.status_var.set(f"Unknown outline_color '{outline_color}', using default.")
 
     def _ensure_selected_model_ready_and_loaded(self) -> bool:
         model_name = self.model_name_var.get().strip() or DEFAULT_MODEL_NAME
@@ -622,25 +718,111 @@ class SamHoverMaskApp:
         return self._load_model()
 
     def _on_threshold_changed(self, _value: str) -> None:
-        self.mask_threshold_text_var.set(f"{self.mask_threshold_var.get():.2f}")
+        self._sync_threshold_display()
+        self._invalidate_committed_overlay_cache()
+        self._render()
+
+    def _reset_mask_threshold(self) -> None:
+        self.mask_threshold_var.set(0.0)
+        self._on_threshold_changed("0.00")
+
+    def _sync_threshold_display(self) -> None:
+        value = float(self.mask_threshold_var.get())
+        self.mask_threshold_text_var.set(f"{value:.2f}")
+        is_nonzero = abs(value) > 1e-9
+        bg = "#ffff00" if is_nonzero else self._mask_threshold_default_bg
+        fg = "#000000" if is_nonzero else self._mask_threshold_default_fg
+        for label in (self.mask_threshold_label, self.mask_threshold_value_label):
+            if label is not None:
+                label.configure(bg=bg, fg=fg)
+
+    def _on_continuous_mask_only_changed(self) -> None:
+        self._seed_mask_cache.clear()
+        if self.pos_points:
+            self._schedule_preview()
+        else:
+            self._render()
+
+    def _on_selection_outline_changed(self, _event: tk.Event | None = None) -> None:
         self._render()
 
     def _on_mouse_wheel(self, event: tk.Event) -> None:
-        delta = int(getattr(event, "delta", 0) or 0)
-        if delta == 0:
+        steps = self._mouse_wheel_steps(event)
+        if steps == 0:
             return
-        steps = int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
-        ctrl_down = bool(int(getattr(event, "state", 0)) & 0x0004)
+        state = int(getattr(event, "state", 0) or 0)
+        shift_down = bool(state & 0x0001)
+        ctrl_down = bool(state & 0x0004)
         if ctrl_down:
             self._adjust_zoom(steps, focus_canvas=(float(event.x), float(event.y)))
+            return
+
+        if shift_down:
+            scroll_px = self._mouse_wheel_scroll_px()
+            self._scroll_view(dx=-steps * scroll_px, dy=0.0)
         else:
             self._adjust_threshold(steps)
+
+    @staticmethod
+    def _mouse_wheel_steps(event: tk.Event) -> int:
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta != 0:
+            return int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
+        button = int(getattr(event, "num", 0) or 0)
+        if button == 4:
+            return 1
+        if button == 5:
+            return -1
+        return 0
 
     def _adjust_threshold(self, steps: int) -> None:
         current = float(self.mask_threshold_var.get())
         updated = float(np.clip(current + 0.25 * steps, -20.0, 20.0))
         self.mask_threshold_var.set(updated)
         self._on_threshold_changed(f"{updated:.2f}")
+
+    def _mouse_wheel_scroll_px(self) -> float:
+        canvas_h = max(float(self.canvas.winfo_height()), 1.0)
+        return float(np.clip(canvas_h * 0.12, 40.0, 160.0))
+
+    def _scroll_view(self, dx: float, dy: float) -> None:
+        if self.image_pil is None:
+            return
+        old_x = float(self.view_x)
+        old_y = float(self.view_y)
+        self.view_x = old_x + float(dx)
+        self.view_y = old_y + float(dy)
+        self._clamp_view()
+        if abs(self.view_x - old_x) < 1e-6 and abs(self.view_y - old_y) < 1e-6:
+            return
+        self._render()
+
+    def _on_middle_mouse_down(self, event: tk.Event) -> str:
+        if self.image_pil is None:
+            self._middle_pan_last_canvas_xy = None
+            return "break"
+        self._middle_pan_last_canvas_xy = (float(event.x), float(event.y))
+        if self.hover_point is not None or self._hover_preview_mask is not None:
+            self.hover_point = None
+            self._hover_preview_mask = None
+            self._render()
+        return "break"
+
+    def _on_middle_mouse_drag(self, event: tk.Event) -> str:
+        previous = self._middle_pan_last_canvas_xy
+        current = (float(event.x), float(event.y))
+        if previous is None:
+            self._middle_pan_last_canvas_xy = current
+            return "break"
+        dx = previous[0] - current[0]
+        dy = previous[1] - current[1]
+        self._middle_pan_last_canvas_xy = current
+        self._scroll_view(dx=dx, dy=dy)
+        return "break"
+
+    def _on_middle_mouse_up(self, _event: tk.Event) -> str:
+        self._middle_pan_last_canvas_xy = None
+        return "break"
 
     def _adjust_zoom(self, steps: int, focus_canvas: tuple[float, float] | None = None) -> None:
         if self.image_pil is None:
@@ -1235,6 +1417,7 @@ class SamHoverMaskApp:
             "image_size_hw": [int(h), int(w)],
             "model_name": self.model_name_var.get().strip() or DEFAULT_MODEL_NAME,
             "threshold_at_click": float(self.mask_threshold_var.get()),
+            "continuous_mask_only_at_click": bool(self.continuous_mask_only_var.get()),
             "zoom_factor_at_click": float(self.zoom_factor),
             "view_origin_xy": [float(self.view_x), float(self.view_y)],
         }
@@ -1259,6 +1442,9 @@ class SamHoverMaskApp:
                 "session_id": int(session_id),
                 "last_updated_utc": self._utc_now_iso(),
                 "threshold_last_saved": threshold,
+                "continuous_mask_only_last_saved": bool(self.continuous_mask_only_var.get()),
+                "mask_values_are_binary": False,
+                "mask_values_kind": "sam_logits",
                 "mask_area_px": area_px,
                 "mask_bbox_xyxy": bbox_xyxy,
                 "mask_logit_min": float(np.min(mask)),
@@ -1288,12 +1474,66 @@ class SamHoverMaskApp:
             return loaded
         return {}
 
-    def _build_annotation_payload(self, saved_at: str) -> dict[str, Any]:
-        h, w = self.image_np.shape[:2]
+    def _sessions_by_mask_index(self) -> dict[int, int]:
         sessions_by_index: dict[int, int] = {}
         for sid, idx in self._session_to_mask_index.items():
             if 0 <= int(idx) < len(self.committed_masks):
                 sessions_by_index[int(idx)] = int(sid)
+        return sessions_by_index
+
+
+    def _session_metadata_for_mask_index(self, idx: int) -> dict[str, Any]:
+        sessions_by_index = self._sessions_by_mask_index()
+        sid = sessions_by_index.get(int(idx))
+        if sid is None:
+            return {}
+        return self._session_metadata.get(int(sid), {})
+
+    @staticmethod
+    def _metadata_marks_binary_mask(md: dict[str, Any]) -> bool:
+        for key in ("mask_values_are_binary", "stored_mask_values_are_binary"):
+            parsed = parse_bool_like(md.get(key))
+            if parsed is True:
+                return True
+        kind = str(md.get("mask_values_kind", "")).strip().lower()
+        stored_kind = str(md.get("stored_mask_values_kind", "")).strip().lower()
+        return kind in {"binary", "thresholded_binary"} or stored_kind in {
+            "binary",
+            "thresholded_binary",
+        }
+
+    @staticmethod
+    def _array_values_are_binary(mask: np.ndarray) -> bool:
+        arr = np.asarray(mask)
+        if arr.size == 0:
+            return False
+        return bool(np.all((arr == 0) | (arr == 1) | (arr == 255)))
+
+    def _threshold_for_committed_mask(self, idx: int, fallback: float) -> float:
+        md = self._session_metadata_for_mask_index(idx)
+        if self._metadata_marks_binary_mask(md):
+            return 0.5
+
+        for key in ("threshold_last_saved", "threshold_at_click"):
+            parsed = parse_float_like(md.get(key))
+            if parsed is not None:
+                return float(parsed)
+        return float(fallback)
+
+    def _thresholds_for_committed_masks(self, fallback: float) -> list[float]:
+        return [
+            self._threshold_for_committed_mask(idx, fallback)
+            for idx in range(len(self.committed_masks))
+        ]
+
+    def _binary_committed_mask_at_index(self, idx: int, fallback: float) -> np.ndarray:
+        mask = np.asarray(self.committed_masks[idx], dtype=np.float32)
+        threshold = self._threshold_for_committed_mask(idx, fallback)
+        return np.asarray(mask > threshold)
+
+    def _build_annotation_payload(self, saved_at: str) -> dict[str, Any]:
+        h, w = self.image_np.shape[:2]
+        sessions_by_index = self._sessions_by_mask_index()
 
         records: list[dict[str, Any]] = []
         total_mask_area_px = 0
@@ -1306,6 +1546,8 @@ class SamHoverMaskApp:
             area_px = md.get("mask_area_px")
             if isinstance(area_px, (int, float)):
                 total_mask_area_px += int(area_px)
+            md["stored_mask_values_are_binary"] = True
+            md["stored_mask_values_kind"] = "thresholded_binary"
             records.append(md)
 
         payload: dict[str, Any] = {
@@ -1316,6 +1558,8 @@ class SamHoverMaskApp:
             "saved_at_utc": saved_at,
             "model_name": self.model_name_var.get().strip() or DEFAULT_MODEL_NAME,
             "mask_threshold": float(self.mask_threshold_var.get()),
+            "continuous_mask_only": bool(self.continuous_mask_only_var.get()),
+            "stored_mask_values_kind": "thresholded_binary",
             "mask_count": int(len(records)),
             "total_mask_area_px": int(total_mask_area_px),
             "records": records,
@@ -1336,10 +1580,14 @@ class SamHoverMaskApp:
                 return True
 
             threshold_for_export = float(self.mask_threshold_var.get())
+            thresholds_for_export = self._thresholds_for_committed_masks(threshold_for_export)
             binary_masks = np.stack(
                 [
-                    np.asarray(np.asarray(mask, dtype=np.float32) > threshold_for_export, dtype=np.uint8)
-                    for mask in self.committed_masks
+                    np.asarray(
+                        self._binary_committed_mask_at_index(idx, threshold_for_export),
+                        dtype=np.uint8,
+                    )
+                    for idx in range(len(self.committed_masks))
                 ],
                 axis=0,
             )
@@ -1347,7 +1595,9 @@ class SamHoverMaskApp:
             saved_at = self._utc_now_iso()
             payload = self._build_annotation_payload(saved_at=saved_at)
             payload["mask_encoding"] = "bitpack_binary_v1"
+            payload["mask_threshold_mode"] = "per_mask"
             payload["mask_threshold_applied"] = threshold_for_export
+            payload["mask_thresholds_applied"] = [float(value) for value in thresholds_for_export]
             payload["mask_shape_nhw"] = [
                 int(binary_masks.shape[0]),
                 int(binary_masks.shape[1]),
@@ -1382,10 +1632,12 @@ class SamHoverMaskApp:
             self._session_metadata.clear()
             return 0
 
+        loaded_masks_are_binary = False
         try:
             with np.load(save_path, allow_pickle=False) as data:
                 metadata_json = data["metadata_json"] if "metadata_json" in data.files else None
                 if "masks_packed" in data.files:
+                    loaded_masks_are_binary = True
                     masks_packed = np.asarray(data["masks_packed"], dtype=np.uint8)
                     shape_arr = (
                         np.asarray(data["masks_shape_nhw"], dtype=np.int64).reshape(-1)
@@ -1449,6 +1701,9 @@ class SamHoverMaskApp:
         loaded_records = payload.get("records", [])
         if isinstance(loaded_records, list):
             records = loaded_records
+        payload_marks_binary = self._metadata_marks_binary_mask(payload)
+        thresholds_applied_raw = payload.get("mask_thresholds_applied", [])
+        thresholds_applied = thresholds_applied_raw if isinstance(thresholds_applied_raw, list) else []
 
         self.last_mask = None
         self.pos_points.clear()
@@ -1474,11 +1729,48 @@ class SamHoverMaskApp:
             rec_data = dict(rec)
             rec_data["session_id"] = int(session_id)
             rec_data["mask_index"] = int(idx)
+
+            threshold_applied = None
+            if idx < len(thresholds_applied):
+                threshold_applied = parse_float_like(thresholds_applied[idx])
+            if threshold_applied is None:
+                threshold_applied = parse_float_like(payload.get("mask_threshold_applied"))
+            if threshold_applied is None:
+                threshold_applied = parse_float_like(payload.get("mask_threshold"))
+            if threshold_applied is not None:
+                rec_data.setdefault("threshold_last_saved", float(threshold_applied))
+                rec_data.setdefault("threshold_at_click", float(threshold_applied))
+                rec_data.setdefault("threshold_applied_to_saved_mask", float(threshold_applied))
+
+            mask_values_are_binary = bool(
+                loaded_masks_are_binary
+                or payload_marks_binary
+                or self._metadata_marks_binary_mask(rec_data)
+                or self._array_values_are_binary(masks[idx])
+            )
+            if mask_values_are_binary:
+                rec_data["mask_values_are_binary"] = True
+                rec_data["mask_values_kind"] = "thresholded_binary"
+                binary = np.asarray(masks[idx] > 0.5)
+                rec_data.setdefault("mask_area_px", int(np.count_nonzero(binary)))
+                if "mask_bbox_xyxy" not in rec_data and bool(np.any(binary)):
+                    ys, xs = np.nonzero(binary)
+                    rec_data["mask_bbox_xyxy"] = [
+                        int(xs.min()),
+                        int(ys.min()),
+                        int(xs.max()),
+                        int(ys.max()),
+                    ]
+            else:
+                rec_data["mask_values_are_binary"] = False
+                rec_data.setdefault("mask_values_kind", "sam_logits")
+
             self._session_to_mask_index[int(session_id)] = int(idx)
             self._session_metadata[int(session_id)] = rec_data
 
         max_session = max(self._session_to_mask_index.keys(), default=0)
         self._active_session_id = int(max_session + 1) if max_session > 0 else 0
+        self._invalidate_committed_overlay_cache()
         return len(self.committed_masks)
 
     def _prepare_display_base(self, reset_view: bool = False) -> None:
@@ -1493,8 +1785,11 @@ class SamHoverMaskApp:
         dw = max(1, int(iw * scale))
         dh = max(1, int(ih * scale))
         resized = image.resize((dw, dh), Image.Resampling.BILINEAR)
+        old_display_size = self.display_size
         self.display_base_np = np.asarray(resized)
         self.display_size = (dw, dh)
+        if self.display_size != old_display_size:
+            self._invalidate_committed_overlay_cache()
         if reset_view:
             self.view_x = 0.0
             self.view_y = 0.0
@@ -1669,7 +1964,7 @@ class SamHoverMaskApp:
     ) -> int:
         if not self.committed_masks:
             return 0
-        threshold = float(self.mask_threshold_var.get())
+        fallback_threshold = float(self.mask_threshold_var.get())
         cx = int(round(float(image_center[0])))
         cy = int(round(float(image_center[1])))
         if self.image_np is None:
@@ -1689,7 +1984,7 @@ class SamHoverMaskApp:
         removed = 0
         # Iterate backwards so index removals are stable.
         for idx in range(len(self.committed_masks) - 1, -1, -1):
-            mask = np.asarray(self.committed_masks[idx] > threshold)
+            mask = self._binary_committed_mask_at_index(idx, fallback_threshold)
             region = mask[y0:y1, x0:x1]
             if region.shape != disk.shape:
                 continue
@@ -1699,6 +1994,8 @@ class SamHoverMaskApp:
         return removed
 
     def _on_mouse_move(self, event: tk.Event) -> None:
+        if self._middle_pan_last_canvas_xy is not None:
+            return
         p = self._to_image_coords(event.x, event.y)
         if p is None:
             if self.hover_point is not None or self._hover_preview_mask is not None:
@@ -1728,6 +2025,7 @@ class SamHoverMaskApp:
         if reset_mask:
             self.last_mask = None
             self.committed_masks.clear()
+            self._invalidate_committed_overlay_cache()
             self._session_to_mask_index.clear()
             self._session_metadata.clear()
             self._active_session_id = 0
@@ -1782,6 +2080,7 @@ class SamHoverMaskApp:
 
         pos_points = [(float(x), float(y)) for x, y in pos]
         neg_points = [(float(x), float(y)) for x, y in neg]
+        continuous_mask_only = bool(self.continuous_mask_only_var.get())
         session_id = int(self._active_session_id)
 
         model = self.model
@@ -1796,12 +2095,10 @@ class SamHoverMaskApp:
                 cacheable = (len(neg_points) == 0) and apply_stabilization
                 if not cacheable:
                     self._seed_mask_cache.clear()
-                trim_component = apply_stabilization and (
-                    len(pos_points) <= int(self._component_trim_limit)
-                )
+                trim_component = apply_stabilization and continuous_mask_only
                 combined_mask: np.ndarray | None = None
                 for px, py in pos_points:
-                    key = (int(round(px)), int(round(py)))
+                    key = (int(round(px)), int(round(py)), bool(continuous_mask_only))
                     current_mask = self._seed_mask_cache.get(key) if cacheable else None
                     if current_mask is None:
                         points = np.asarray([(px, py), *neg_points], dtype=np.float32)
@@ -1947,6 +2244,7 @@ class SamHoverMaskApp:
                         self._session_to_mask_index[session_id] = len(self.committed_masks) - 1
                     else:
                         self.committed_masks[existing] = mask.copy()
+                    self._invalidate_committed_overlay_cache()
                     self._update_session_metadata_with_mask(session_id=session_id, mask=mask)
                     self._save_annotations_for_current_image()
                     should_auto_advance = self._auto_advance_session_id == int(session_id)
@@ -1977,6 +2275,7 @@ class SamHoverMaskApp:
         if idx < 0 or idx >= len(self.committed_masks):
             return False
         self.committed_masks.pop(idx)
+        self._invalidate_committed_overlay_cache()
 
         for sid, cur_idx in list(self._session_to_mask_index.items()):
             if cur_idx == idx:
@@ -2027,24 +2326,37 @@ class SamHoverMaskApp:
         y1 = min(dh, y0 + canvas_h)
         frame = base[y0:y1, x0:x1].copy()
 
-        combined_mask: np.ndarray | None = None
         threshold = float(self.mask_threshold_var.get())
-        for m in self.committed_masks:
-            cur = np.asarray(m > threshold)
-            combined_mask = cur if combined_mask is None else (combined_mask | cur)
-        if combined_mask is None and self.last_mask is not None:
-            combined_mask = np.asarray(self.last_mask > threshold)
+        crop_box = (x0, y0, x1, y1)
+        self._blend_committed_overlay_on_frame(frame, threshold, crop_box)
+        if not self.committed_masks and self.last_mask is not None:
+            self._overlay_mask_on_frame(
+                frame,
+                self.last_mask,
+                threshold,
+                crop_box,
+                self._mask_color_for_index(0),
+                MASK_OVERLAY_ALPHA,
+            )
         if self._hover_preview_mask is not None:
-            hover_mask = np.asarray(self._hover_preview_mask > threshold)
-            combined_mask = hover_mask if combined_mask is None else (combined_mask | hover_mask)
+            self._overlay_mask_on_frame(
+                frame,
+                self._hover_preview_mask,
+                threshold,
+                crop_box,
+                self._mask_color_for_index(len(self.committed_masks)),
+                HOVER_MASK_OVERLAY_ALPHA,
+            )
 
-        if combined_mask is not None:
-            mask_img = Image.fromarray((combined_mask.astype(np.uint8) * 255), mode="L")
-            mask_img = mask_img.resize(self.display_size, Image.Resampling.NEAREST)
-            mask_crop = mask_img.crop((x0, y0, x1, y1))
-            mask_arr = np.asarray(mask_crop) > 0
-            # Semi-transparent cyan overlay
-            frame[mask_arr] = (0.35 * frame[mask_arr] + 0.65 * np.array([30, 220, 220])).astype(np.uint8)
+        outline_mask = self._active_selection_mask_for_outline()
+        if bool(self.selection_outline_var.get()) and outline_mask is not None:
+            self._outline_mask_on_frame(
+                frame,
+                outline_mask,
+                threshold,
+                crop_box,
+                self._outline_color_for_name(self.selection_outline_color_var.get()),
+            )
 
         # Draw prompt points (in display coordinates)
         iw = self.image_np.shape[1] if self.image_np is not None else 1
@@ -2086,6 +2398,7 @@ class SamHoverMaskApp:
                 continue
             x = int(round(cx))
             y = int(round(cy))
+            label_fill = self._rgb_to_hex(self._mask_color_for_index(num - 1))
             # Light outline for readability across bright/dark backgrounds.
             for ox, oy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 self.canvas.create_text(
@@ -2100,10 +2413,167 @@ class SamHoverMaskApp:
                 x,
                 y,
                 text=str(num),
-                fill="#ffffff",
+                fill=label_fill,
                 font=("TkDefaultFont", 11, "bold"),
                 anchor=tk.CENTER,
             )
+
+    def _invalidate_committed_overlay_cache(self) -> None:
+        self._committed_overlay_signature = None
+        self._committed_overlay_rgb = None
+        self._committed_overlay_base_weight = None
+
+    def _committed_overlay_cache_signature(
+        self, thresholds: list[float]
+    ) -> tuple[Any, ...]:
+        return (
+            self.display_size,
+            tuple(float(value) for value in thresholds),
+            tuple(id(mask) for mask in self.committed_masks),
+        )
+
+    def _ensure_committed_overlay_cache(self, threshold: float) -> None:
+        thresholds = self._thresholds_for_committed_masks(threshold)
+        signature = self._committed_overlay_cache_signature(thresholds)
+        if (
+            self._committed_overlay_signature == signature
+            and self._committed_overlay_rgb is not None
+            and self._committed_overlay_base_weight is not None
+        ):
+            return
+
+        if not self.committed_masks:
+            self._committed_overlay_signature = signature
+            self._committed_overlay_rgb = None
+            self._committed_overlay_base_weight = None
+            return
+
+        dw, dh = self.display_size
+        overlay_rgb = np.zeros((dh, dw, 3), dtype=np.float32)
+        base_weight = np.ones((dh, dw), dtype=np.float32)
+        alpha = float(MASK_OVERLAY_ALPHA)
+        keep_base = 1.0 - alpha
+        for idx in range(len(self.committed_masks)):
+            mask_arr = self._binary_committed_mask_at_index(idx, threshold)
+            if mask_arr.ndim != 2:
+                continue
+            mask_img = Image.fromarray((mask_arr.astype(np.uint8) * 255), mode="L")
+            mask_img = mask_img.resize(self.display_size, Image.Resampling.NEAREST)
+            mask_display = np.asarray(mask_img) > 0
+            if not bool(np.any(mask_display)):
+                continue
+            color_arr = np.asarray(self._mask_color_for_index(idx), dtype=np.float32)
+            overlay_rgb[mask_display] = keep_base * overlay_rgb[mask_display] + alpha * color_arr
+            base_weight[mask_display] *= keep_base
+
+        self._committed_overlay_signature = signature
+        self._committed_overlay_rgb = overlay_rgb
+        self._committed_overlay_base_weight = base_weight
+
+    def _blend_committed_overlay_on_frame(
+        self,
+        frame: np.ndarray,
+        threshold: float,
+        crop_box: tuple[int, int, int, int],
+    ) -> None:
+        self._ensure_committed_overlay_cache(threshold)
+        if self._committed_overlay_rgb is None or self._committed_overlay_base_weight is None:
+            return
+        x0, y0, x1, y1 = crop_box
+        rgb_crop = self._committed_overlay_rgb[y0:y1, x0:x1]
+        weight_crop = self._committed_overlay_base_weight[y0:y1, x0:x1]
+        active = weight_crop < 0.999
+        if not bool(np.any(active)):
+            return
+        frame[active] = (
+            frame[active].astype(np.float32) * weight_crop[active, None]
+            + rgb_crop[active]
+        ).astype(np.uint8)
+
+    @staticmethod
+    def _mask_color_for_index(index: int) -> tuple[int, int, int]:
+        return MASK_OVERLAY_COLORS[int(index) % len(MASK_OVERLAY_COLORS)]
+
+    @staticmethod
+    def _normalize_outline_color_name(raw_name: str) -> str | None:
+        wanted = str(raw_name or "").strip().lower().replace("_", " ").replace("-", " ")
+        for name, _color in OUTLINE_COLOR_CHOICES:
+            normalized = name.lower().replace("_", " ").replace("-", " ")
+            if wanted in {normalized, normalized.removeprefix("neon ")}:
+                return name
+        return None
+
+    @staticmethod
+    def _outline_color_for_name(raw_name: str) -> tuple[int, int, int]:
+        name = SamHoverMaskApp._normalize_outline_color_name(raw_name)
+        if name is None:
+            name = DEFAULT_OUTLINE_COLOR_NAME
+        return OUTLINE_COLOR_MAP[name]
+
+    @staticmethod
+    def _rgb_to_hex(color: tuple[int, int, int]) -> str:
+        return f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
+
+    def _active_selection_mask_for_outline(self) -> np.ndarray | None:
+        if self._hover_preview_mask is not None:
+            return self._hover_preview_mask
+        if self.pos_points and self.last_mask is not None:
+            return self.last_mask
+        return None
+
+    def _overlay_mask_on_frame(
+        self,
+        frame: np.ndarray,
+        mask: np.ndarray,
+        threshold: float,
+        crop_box: tuple[int, int, int, int],
+        color: tuple[int, int, int],
+        alpha: float,
+    ) -> None:
+        mask_arr = np.asarray(mask > threshold)
+        if mask_arr.ndim != 2:
+            return
+        mask_img = Image.fromarray((mask_arr.astype(np.uint8) * 255), mode="L")
+        mask_img = mask_img.resize(self.display_size, Image.Resampling.NEAREST)
+        mask_crop = mask_img.crop(crop_box)
+        mask_crop_arr = np.asarray(mask_crop) > 0
+        if not bool(np.any(mask_crop_arr)):
+            return
+        color_arr = np.asarray(color, dtype=np.float32)
+        frame[mask_crop_arr] = (
+            (1.0 - float(alpha)) * frame[mask_crop_arr].astype(np.float32)
+            + float(alpha) * color_arr
+        ).astype(np.uint8)
+
+    def _outline_mask_on_frame(
+        self,
+        frame: np.ndarray,
+        mask: np.ndarray,
+        threshold: float,
+        crop_box: tuple[int, int, int, int],
+        color: tuple[int, int, int],
+    ) -> None:
+        mask_arr = np.asarray(mask > threshold)
+        if mask_arr.ndim != 2:
+            return
+        mask_img = Image.fromarray((mask_arr.astype(np.uint8) * 255), mode="L")
+        mask_img = mask_img.resize(self.display_size, Image.Resampling.NEAREST)
+        mask_crop = mask_img.crop(crop_box)
+        mask_crop_arr = np.asarray(mask_crop) > 0
+        if not bool(np.any(mask_crop_arr)):
+            return
+
+        padded = np.pad(mask_crop_arr, 1, mode="constant", constant_values=False)
+        neighbors_all_foreground = (
+            padded[1:-1, :-2]
+            & padded[1:-1, 2:]
+            & padded[:-2, 1:-1]
+            & padded[2:, 1:-1]
+        )
+        outline = mask_crop_arr & (~neighbors_all_foreground)
+        if not bool(np.any(outline)):
+            return
+        frame[outline] = np.asarray(color, dtype=np.uint8)
 
     @staticmethod
     def _draw_dot(frame: np.ndarray, x: int, y: int, color: tuple[int, int, int], radius: int = 5) -> None:

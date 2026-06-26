@@ -55,6 +55,8 @@ Lightweight desktop GUI to measure things using SAM.
   - Right click: remove point(s) or committed mask(s) near the cursor
   - Mouse hover: temporary positive point for live preview
 - Shows a live mask overlay as you move the mouse.
+- Can keep masks continuous by retaining only the component connected to the click.
+- Can draw a one-pixel neon outline around the active selection preview.
 - Persists annotations as:
   - compact binary mask archive: `<image>.sam_clicks.npz` (bit-packed masks for smaller files)
   - human-readable metadata: `<image>.sam_clicks.json` (seed `x/y`, area, bbox, stats)
@@ -92,6 +94,7 @@ ONNX weights are stored in `antscihub-sam-measurer/models/`.
 SAM annotation files are saved next to the image being annotated:
 
 - `<image>.sam_clicks.npz`: compressed binary masks, stored as bit-packed mask arrays.
+  Each mask is packed using that click's saved threshold.
 - `<image>.sam_clicks.json`: readable metadata with image size, model name, threshold,
   mask count, total mask area in pixels, and per-mask seed point, bbox, area, and
   logit stats.
@@ -175,6 +178,9 @@ JSON, the annotation JSON, and each per-click record.
 
 - `Left click`: seed/reseed current object
 - `Right click`: remove nearby point(s) and/or committed mask(s)
+- `Mouse wheel`: pan vertically while zoomed
+- `Shift` + `Mouse wheel`: pan horizontally while zoomed
+- `Ctrl` + `Mouse wheel`: zoom around the cursor
 - `n`: start a new object
 - `c`: clear prompts
 

@@ -52,6 +52,25 @@ parameters:
         type: number
         default: 0.0
         description: Initial GUI mask threshold when launching visual mode.
+      continuous_mask_only:
+        type: boolean
+        default: true
+        description: Keep only the mask component connected to the clicked seed point.
+      add_outline:
+        type: boolean
+        default: true
+        description: Draw a one-pixel outline around the active selection mask in visual mode.
+      outline_color:
+        type: string
+        default: "Neon cyan"
+        enum:
+          - "Neon cyan"
+          - "Neon lime"
+          - "Neon pink"
+          - "Neon yellow"
+          - "Neon orange"
+          - "Neon violet"
+        description: Outline color used when add_outline is enabled.
       source_input:
         type: string
         default: ""
