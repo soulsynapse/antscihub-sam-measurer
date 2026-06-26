@@ -1,202 +1,180 @@
 # antscihub-sam-measurer
 
-Lightweight desktop GUI to measure things using SAM.
+Lightweight desktop GUI to measure objects in images using Segment Anything (SAM).
 
 ![SAM measurer GUI example](docs/images/sam-measurer-example.png)
 
-## General Workflow
+## Install
 
-1. Run scale-bar config on the image that contains the scale bar.
-
-   ```powershell
-   python antscihub-sam-measurer/scale_bar_config.py --source-input "path\to\image-folder\scale-bar-image.jpg"
-   ```
-
-   Click the two ends of the scale bar, enter the known length and unit, then
-   press `Accept`. This writes
-   `<scale-bar-image-stem>.scale_bar_config.result.json` next to that image.
-
-2. Run `precompute_embeddings.py` to precompute SAM embeddings overnight.
-
-   ```powershell
-   python antscihub-sam-measurer/precompute_embeddings.py --source-folder "path\to\image-folder"
-   ```
-
-   This walks the folder and all subfolders, downloads the selected model if
-   needed, skips fresh embedding caches, and writes the same
-   `<image>.<hash>.sam_embedding.npz` files that the GUI uses. You can skip
-   this step for small batches, but it is the recommended overnight preparation
-   step before clicking masks in the morning.
-
-3. Run the SAM mask GUI on the images you want to measure.
-
-   ```powershell
-   python antscihub-sam-measurer/sam_hover_mask_gui.py
-   ```
-
-   Open images from the same folder, click objects to create masks, and let the
-   GUI autosave each image's `.sam_clicks.json` and `.sam_clicks.npz` files.
-
-4. Export the folder measurements to CSV.
-
-   ```powershell
-   python antscihub-sam-measurer/folder-to-csv.py --source-folder "path\to\image-folder"
-   ```
-
-   This reads the scale-bar config plus all saved SAM click metadata in that
-   folder and writes `sam_mask_measurements.csv` back into the folder.
-
-## What it does
-
-- Loads Segment Anything ONNX encoder/decoder.
-- Loads an image.
-- Supports positive prompts and point erasing:
-  - Left click: seed (or reseed) the current object
-  - Ctrl + left click: add an ignored region that is subtracted from masks
-  - Right click: remove point(s) or committed mask(s) near the cursor
-  - Ctrl + right click: remove ignored region(s) near the cursor
-  - Mouse hover: temporary positive point for live preview
-- Shows a live mask overlay as you move the mouse.
-- Can keep masks continuous by retaining only the component connected to the click.
-- Can draw a one-pixel neon outline around the active selection preview.
-- Persists annotations as:
-  - compact binary mask archive: `<image>.sam_clicks.npz` (bit-packed masks for smaller files)
-  - human-readable metadata: `<image>.sam_clicks.json` (seed `x/y`, area, bbox, stats)
-- Provides a scale-bar calibration helper that saves a JSON calibration next to
-  the reference image.
-
-## Setup
-
-From the workspace root:
+Use Git to pull this project into a folder on your computer. VS Code is the recommended way to work with it because you can keep the folder, terminal, and virtual environment visible in one place.
 
 ```powershell
-python -m venv antscihub-sam-measurer/.venv
-antscihub-sam-measurer/.venv/Scripts/Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r antscihub-sam-measurer/requirements.txt
+git clone <repo-url> antscihub-sam-measurer
+cd antscihub-sam-measurer
+code .
 ```
+
+If you already cloned the folder earlier, open that folder in VS Code and update it with:
+
+```powershell
+git pull
+```
+
+In the VS Code terminal, create a virtual environment in this folder and install the requirements:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+If setup worked, you should have:
+
+- VS Code open to the `antscihub-sam-measurer` folder.
+- A `.venv` virtual environment inside the folder.
+- The packages from `requirements.txt` installed.
+- A terminal that is ready to run the tools below.
 
 Required packages include `onnxruntime`, `numpy`, `Pillow`, and `gdown`.
 
-## Run SAM Mask GUI
+## Typical Workflow
 
-From the workspace root:
+1. **Calibrate** — Run `scale_bar_config.py` on the image that contains your scale bar. Click the two ends, enter the known length and unit, and press `Accept`. One config file covers the whole folder.
+
+2. **Precompute** (optional, recommended for large batches) — Run `precompute_embeddings.py` on your image folder to cache SAM embeddings before you start clicking. Skip this for small jobs; the GUI caches on demand.
+
+3. **Annotate** — Open `sam_hover_mask_gui.py`, load each image, and click objects to create and save masks.
+
+4. **Export** — Run `folder-to-csv.py` on the folder to combine the scale calibration with all saved mask data into one CSV.
+
+## Run the Mask GUI
+
+Start the main click tool from the VS Code terminal:
 
 ```powershell
-python antscihub-sam-measurer/sam_hover_mask_gui.py
+python sam_hover_mask_gui.py
 ```
 
-When you pick a model, the app automatically downloads missing ONNX weights and
-loads the SAM sessions for you.
+The first launch may look like it is hanging while it downloads SAM model weights. Watch the VS Code terminal: the download progress should appear there. The default model is `Segment-Anything (accuracy)`, which uses the quantized ViT-H ONNX weights. Expect about 665 MB of model files for the default model. Weights are stored in `models/`, so this should only happen once per model.
 
-ONNX weights are stored in `antscihub-sam-measurer/models/`.
+After the model is ready, open an image and start clicking objects.
 
-## SAM Outputs
+SAM runs internally at a 1024-pixel model size. For best precision, use images where the object you care about is large enough to be well represented at that scale. If a full image is very large or contains many small subjects, consider cropping or cutting it into tiles before measuring; this often improves detection more reliably than sensitivity tweaks.
 
-SAM annotation files are saved next to the image being annotated:
+You can choose other model weights from the model dropdown:
 
-- `<image>.sam_clicks.npz`: compressed binary masks, stored as bit-packed mask arrays.
-  Each mask is packed using that click's saved threshold; ignored regions are packed separately and subtracted by the GUI and metadata.
-- `<image>.sam_clicks.json`: readable metadata with image size, model name, threshold,
-  mask count, ignore-mask count, total mask area in pixels, and per-mask seed point,
-  bbox, area, and logit stats.
+- `Segment-Anything (accuracy)`: default, best quality for most tasks.
+- `Segment-Anything (balanced)`: middle ground.
+- `Segment-Anything (speed)`: smaller/faster.
+- `Segment-Anything (Edge)`: lightweight EdgeSAM option.
+
+## Mask GUI Controls
+
+- `Ctrl` + mouse wheel: zoom in and out around the cursor.
+- Hold middle mouse button and drag: pan around the image.
+- Left click: assign a mask for the current object.
+- Right click: remove a nearby mask or point.
+- `Ctrl` + left click: assign an ignored region, which is subtracted from masks.
+- `Ctrl` + right click: remove a nearby ignored region.
+- Mouse wheel: increase or decrease mask sensitivity.
+- `Shift` + mouse wheel: pan horizontally while zoomed.
+- `n`: start a new object.
+- `c`: clear prompts.
+
+Sensitivity is the `Mask threshold` value. Typically you want to keep it at `0.00`. Increasing or decreasing sensitivity can subtly adjust which pixels the model includes, but if you need accuracy, cropping or tiling the image is usually the better move.
+
+## Autosaved Mask Data
+
+As soon as a mask is calculated, the tool saves annotation files next to the image:
+
+- `<image>.sam_clicks.json`: human-readable metadata.
+- `<image>.sam_clicks.npz`: compact bit-packed mask data.
 - `<image>.<hash>.sam_embedding.npz`: cached SAM embedding for faster reopening.
 
-Runner mode also writes its configured result JSON, typically named like:
+The JSON has the information needed to inspect or export the mask: image name, image size, model name, click location, mask number, pixel area, bounding box, threshold/sensitivity, continuous-mask setting, ignored-region metadata, and other mask statistics. The exact list of captured fields is visible by opening the JSON file directly, or by opening the folder in the QC tool.
 
-- `<stem>.sam_masks_from_clicks.result.json`
-
-That result JSON points to the annotation files and reports saved mask counts and
-total mask area.
-
-## Precompute Embeddings
-
-To precompute embeddings recursively for a folder tree:
+Run the QC viewer with:
 
 ```powershell
-python antscihub-sam-measurer/precompute_embeddings.py --source-folder "path\to\image-folder"
+python sam_mask_qc_tool.py "path\to\image-folder"
 ```
 
-If no folder is provided, the script opens a folder picker. It uses
-`Segment-Anything (accuracy)` by default, downloads missing ONNX weights, and
-skips images whose embedding cache is already fresh. Use `--force` to recompute
-everything.
+The QC tool lets you quickly step through masks, inspect the masked subject, view the stats table, and see scale-derived values when a scale-bar config is available.
 
-Optional summary file:
+## Batch Processing
+
+When you load or browse images in the GUI, you may notice a slow `Computing embedding` step. That embedding is cached per image and model, but the first pass can take a while.
+
+To compute embeddings ahead of time for a whole folder tree, run:
 
 ```powershell
-python antscihub-sam-measurer/precompute_embeddings.py --source-folder "path\to\image-folder" --summary-json "path\to\summary.json"
+python precompute_embeddings.py --source-folder "path\to\image-folder"
+```
+
+This recursively scans the selected folder and all child folders, downloads the selected model if needed, skips fresh caches, and writes the same embedding files the GUI uses. Use `--force` if you intentionally want to recompute everything.
+
+Optional summary output:
+
+```powershell
+python precompute_embeddings.py --source-folder "path\to\image-folder" --summary-json "path\to\summary.json"
 ```
 
 ## Scale Bar Config
 
-Launch the scale-bar helper with an image or image folder:
+If you need real-world units, run the scale-bar config tool on an image that contains a known scale bar:
 
 ```powershell
-python antscihub-sam-measurer/scale_bar_config.py --source-input "path\to\image.jpg"
+python scale_bar_config.py --source-input "path\to\image-folder\scale-bar-image.jpg"
 ```
 
-In the GUI, click two points on the reference scale bar, enter the known length
-and unit, then press `Accept`.
-
-When run directly, the scale-bar config is saved next to the selected/reference
-image:
+Click the two ends of the scale bar, enter the known length and unit, then press `Accept`. This writes:
 
 - `<image-stem>.scale_bar_config.result.json`
 
-The JSON includes:
+Typically you want one scale-bar config file per image folder. The CSV exporter and QC tool will use it to compute relative values such as area in `mm^2` or length in `mm`. If the source folder already has a scale-bar config, the scale-bar helper opens the matching reference image and preloads its saved points, known length, and unit.
 
-- selected image path and image size
-- `point_a` and `point_b`
-- measured `pixel_distance`
-- `known_length` and `length_unit`
-- `pixels_per_unit` and `units_per_pixel`
-- the folder/image scope the calibration applies to
+## Export Measurements
 
-Runner mode writes the same payload to the explicit `--output-result-json` or
-`--output-scale-bar-config-json` path.
-
-## Folder CSV Export
-
-After annotating images and creating a scale-bar config, export mask areas for a
-folder:
+After annotating images and creating a scale-bar config, export measurements for a folder:
 
 ```powershell
-python antscihub-sam-measurer/folder-to-csv.py --source-folder "path\to\image-folder"
+python folder-to-csv.py --source-folder "path\to\image-folder"
 ```
 
-If no folder is provided, the script opens a folder picker. It reads the newest
-`*.scale_bar_config.result.json` in the selected folder and all
-`*.sam_clicks.json` files in that folder, then writes:
+This reads the newest `*.scale_bar_config.result.json` in the folder and all `*.sam_clicks.json` files in that folder, then writes:
 
 - `sam_mask_measurements.csv`
 
-The CSV keeps the measurement columns first: image name, click number, pixel
-area, `units_per_pixel` from the scale-bar config, computed area, and computed
-area unit. It also appends flattened metadata columns from the scale-bar config
-JSON, the annotation JSON, and each per-click record.
+The CSV keeps the measurement columns first, including image name, mask/click number, pixel area, `units_per_pixel`, computed area, and computed area unit. It also appends flattened metadata from the scale-bar config, the annotation JSON, and each mask record.
 
-## Controls
+## Where Information Lives
 
-- `Left click`: seed/reseed current object
-- `Ctrl` + `Left click`: add an ignored region that is subtracted from masks
-- `Right click`: remove nearby point(s) and/or committed mask(s)
-- `Ctrl` + `Right click`: remove nearby ignored region(s)
-- `Mouse wheel`: adjust mask threshold
-- `Shift` + `Mouse wheel`: pan horizontally while zoomed
-- `Ctrl` + `Mouse wheel`: zoom around the cursor
-- `Middle mouse drag`: pan around while zoomed
-- `n`: start a new object
-- `c`: clear prompts
+For an image named `larva_001.jpg`, you might see:
+
+- `larva_001.jpg`: original image.
+- `larva_001.jpg.sam_clicks.json`: readable mask metadata.
+- `larva_001.jpg.sam_clicks.npz`: compact binary mask archive.
+- `larva_001.jpg.<hash>.sam_embedding.npz`: cached SAM embedding.
+- `scale_reference.scale_bar_config.result.json`: folder scale calibration.
+- `sam_mask_measurements.csv`: exported folder-level measurement table.
+
+Examples of useful fields:
+
+- Pixel area for a mask: `records[].mask_area_px`.
+- Bounding box: `records[].mask_bbox_xyxy`.
+- Click location: `records[].seed_point_xy`.
+- Sensitivity at click time: `records[].threshold_at_click`.
+- Model used: `records[].model_name`.
+- Scale conversion: `scale_bar.units_per_pixel` in the scale-bar config.
+- Computed CSV area: `computed_area` and `computed_area_unit`.
+
+The JSON files are the detailed record. The CSV is the convenient spreadsheet. The QC tool is the fastest way to visually verify that a mask and its stats are the ones you meant to measure.
 
 ## License and Attribution
 
-This project is licensed under CC BY-NC 4.0. It was heavily inspired by
-Annolid, which is copyright (c) 2024 Computational Physiology Laboratory and is
-also distributed under CC BY-NC 4.0.
+This project is licensed under CC BY-NC 4.0. It was heavily inspired by Annolid, which is copyright (c) 2024 Computational Physiology Laboratory and is also distributed under CC BY-NC 4.0.
 
-I made this project because I could not figure out how to get Annolid working
-for my workflow, but Annolid's methods were clear enough to guide this smaller,
-focused SAM measurement tool.
+I made this project because I could not figure out how to get Annolid working for my workflow, but Annolid's methods were clear enough to guide this smaller, focused SAM measurement tool.
 
 See [LICENSE](LICENSE) for the full local attribution notice.
