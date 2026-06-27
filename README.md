@@ -5,9 +5,12 @@ Lightweight desktop GUI to measure objects in images using Segment Anything (SAM
 ![SAM measurer GUI example](docs/images/sam-measurer-example.png)
 
 ## Scope, or, who this tool is for:
-This tool is meant to do one thing well: If you have an appropriate job, it will speed up your measurement workflow.
+You have a folder of images, each containing objects you need to measure. You want real-world area measurements. Manual tracing is too slow; a fully automated pipeline isn't available or isn't trustworthy for your subjects. This tool lets you click each object, uses SAM to generate the segmentation mask, and handles calibration, QC, and CSV export.
 
-All future versions and features will be in service of that.
+This does two things:
+
+1. If you need to do quick measurements (~1k), you can use this to do it fast.
+2. If you need to do a **lot** of measurements, you can generate a quality training set.
 
 TODO: Add a video of the workflow.
 
