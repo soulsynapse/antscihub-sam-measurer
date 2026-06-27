@@ -5,17 +5,12 @@ Lightweight desktop GUI to measure objects in images using Segment Anything (SAM
 ![SAM measurer GUI example](docs/images/sam-measurer-example.png)
 
 ## Scope, or, who this tool is for:
-This tool is meant to do one thing well: **If you have an appropriate job**, it will speed up your imagej measurement workflows by *at least* 10x.
+This tool is meant to do one thing well: If you have an appropriate job, it will speed up your measurement workflow.
 
-All future versions will be to that end.
-
-For a job to be appropriate:
-
-1. The subject needs to be appropriately isolated. Joined subjects don't work well.
-2. The quality needs to be relatively crisp.
-3. The image itself can't be massive. It still works with large images, just.. not very well.
+All future versions and features will be in service of that.
 
 TODO: Add a video of the workflow.
+
 
 ## Current features:
 
