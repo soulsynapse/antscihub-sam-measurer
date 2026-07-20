@@ -5,6 +5,7 @@ import argparse
 from version import __version__
 import csv
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -25,6 +26,8 @@ BASE_CSV_COLUMNS = [
     "ratio_units_per_pixel",
     "computed_area",
     "computed_area_unit",
+    "measure_count",
+    "measurement_length_unit",
 ]
 
 
@@ -196,6 +199,49 @@ def image_name_from_annotation(path: Path, payload: dict[str, Any]) -> str:
     return path.stem
 
 
+def manual_measure_distances_px(record: dict[str, Any]) -> list[float]:
+    """Return valid manual measurements in their persisted draw order."""
+    raw_measures = record.get("manual_measures")
+    if isinstance(raw_measures, str):
+        try:
+            raw_measures = json.loads(raw_measures)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(raw_measures, list):
+        return []
+
+    distances: list[float] = []
+    for raw_measure in raw_measures:
+        if not isinstance(raw_measure, dict):
+            continue
+        try:
+            distance_px = float(raw_measure["distance_px"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(distance_px) and distance_px >= 0:
+            distances.append(distance_px)
+    return distances
+
+
+def manual_measure_columns(
+    record: dict[str, Any],
+    units_per_pixel: float,
+    length_unit: str,
+) -> dict[str, Any]:
+    distances_px = manual_measure_distances_px(record)
+    columns: dict[str, Any] = {
+        "measure_count": len(distances_px),
+        "measurement_length_unit": length_unit,
+    }
+    calibrated_suffix = sanitize_column_part(length_unit)
+    for measure_index, distance_px in enumerate(distances_px, start=1):
+        columns[f"measure_{measure_index}_px"] = distance_px
+        columns[f"measure_{measure_index}_{calibrated_suffix}"] = (
+            distance_px * units_per_pixel
+        )
+    return columns
+
+
 def recovered_mask_metadata(
     annotation_metadata_path: Path,
     payload: dict[str, Any],
@@ -318,6 +364,11 @@ def read_area_rows(
                     "ratio_units_per_pixel": units_per_pixel,
                     "computed_area": pixel_area * area_ratio,
                     "computed_area_unit": area_unit,
+                    **manual_measure_columns(
+                        record_for_csv,
+                        units_per_pixel=units_per_pixel,
+                        length_unit=length_unit,
+                    ),
                     **scale_metadata,
                     **annotation_metadata,
                     **flatten_json_fields("record", record_for_csv),
