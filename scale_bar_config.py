@@ -16,6 +16,14 @@ SCALE_BAR_CONFIG_SUFFIX = ".scale_bar_config.result.json"
 APPLIES_TO_PREVIEW_LIMIT_DEFAULT = 200
 
 
+class ScaleBarGuiResult(dict[str, Any]):
+    """GUI payload plus a non-serialized path used to choose its output file."""
+
+    def __init__(self, payload: dict[str, Any], selected_image_path: Path) -> None:
+        super().__init__(payload)
+        self.selected_image_path = selected_image_path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -417,8 +425,10 @@ def build_result_payload(
         "stage_id": "scale_bar_config",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "selection_mode": selection_mode,
-        "source_input": str(source_input),
-        "selected_image_path": str(image_path),
+        # The result is stored beside the reference image. Keep only portable
+        # references so a copied folder works on another computer.
+        "source_input": image_path.name if source_input.is_file() else ".",
+        "selected_image_path": image_path.name,
         "selected_image_name": image_path.name,
         "image_size": {
             "width": int(image_width),
@@ -435,7 +445,7 @@ def build_result_payload(
         },
         "applies_to": {
             "scope": scope,
-            "folder_path": str(applies_to_folder) if applies_to_folder is not None else None,
+            "folder_path": "." if applies_to_folder is not None else None,
             "image_count": len(applicable_image_paths),
             "reference_image_index": selected_index,
             "image_glob_used": as_str(params, "image_glob", IMAGE_GLOBS_DEFAULT),
@@ -544,7 +554,11 @@ def load_scale_bar_preload(
     return None
 
 
-def launch_gui(initial_source_input: Path | None, params: dict[str, Any], existing_result_path: Path | None = None) -> dict[str, Any]:
+def launch_gui(
+    initial_source_input: Path | None,
+    params: dict[str, Any],
+    existing_result_path: Path | None = None,
+) -> dict[str, Any]:
     try:
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
@@ -1027,7 +1041,7 @@ def launch_gui(initial_source_input: Path | None, params: dict[str, Any], existi
             return self.result
 
     window = ScaleBarWindow()
-    return window.run()
+    return ScaleBarGuiResult(window.run(), image_path)
 
 
 def run_stage_for_runner(source_input: Path, params: dict[str, Any], output_result_json: Path | None = None) -> dict[str, Any]:
@@ -1094,8 +1108,11 @@ def main() -> int:
             else None
         )
         payload = launch_gui(gui_source, gui_params, explicit_output_result_json)
-        output_result_json = explicit_output_result_json or direct_output_path_for_payload(payload)
-        payload["output_result_json"] = str(output_result_json)
+        selected_image_path = payload.selected_image_path
+        output_result_json = explicit_output_result_json or direct_output_path_for_image(
+            selected_image_path
+        )
+        payload["output_result_json"] = output_result_json.name
         write_result_json(output_result_json, payload)
         print(f"Wrote result JSON: {output_result_json}", flush=True)
         print(json.dumps(payload, indent=2), flush=True)
@@ -1132,8 +1149,9 @@ def main() -> int:
     gui_params_raw = args.gui_params_json or args.params_json or ""
     gui_params = load_json_object_optional(gui_params_raw)
     payload = launch_gui(gui_source, gui_params)
-    output_result_json = direct_output_path_for_payload(payload)
-    payload["output_result_json"] = str(output_result_json)
+    selected_image_path = payload.selected_image_path
+    output_result_json = direct_output_path_for_image(selected_image_path)
+    payload["output_result_json"] = output_result_json.name
     write_result_json(output_result_json, payload)
     print(f"Wrote result JSON: {output_result_json}", flush=True)
     print(json.dumps(payload, indent=2), flush=True)

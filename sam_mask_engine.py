@@ -580,7 +580,9 @@ def build_annotation_payload(
 
     return {
         "version": 1,
-        "image_path": str(image_path) if image_path is not None else "",
+        # The sidecar lives beside its image, so retain a portable relative
+        # reference rather than the creating computer's absolute path.
+        "image_path": image_path.name if image_path is not None else "",
         "image_name": image_path.name if image_path is not None else "",
         "image_size_hw": [int(h), int(w)],
         "saved_at_utc": saved_at,

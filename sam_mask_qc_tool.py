@@ -291,8 +291,18 @@ def build_entry_from_csv_row(
     image_name = str(row.get("image_name") or row.get("annotation_image_name") or "").strip()
     metadata_candidate = resolve_path(row.get("annotation_metadata_path"), folder)
     image_candidate = resolve_path(row.get("annotation_image_path"), folder)
-    if image_candidate is None and image_name:
-        image_candidate = (folder / image_name).resolve()
+    local_image_candidate = (folder / image_name).resolve() if image_name else None
+    # CSV exports retain annotation_image_path, which can be an absolute path on
+    # the computer that created the annotations. Prefer the copied folder's
+    # same-named image when that original path is unavailable.
+    if (
+        (image_candidate is None or not image_candidate.exists())
+        and local_image_candidate is not None
+        and local_image_candidate.exists()
+    ):
+        image_candidate = local_image_candidate
+    elif image_candidate is None:
+        image_candidate = local_image_candidate
     if metadata_candidate is None and image_candidate is not None:
         metadata_candidate = metadata_path_for_image(image_candidate)
     if metadata_candidate is not None and image_candidate is None:
@@ -548,6 +558,12 @@ def load_mask_entries(folder: Path, output_file: Path | None = None) -> tuple[li
     folder = folder.expanduser().resolve()
     if not folder.is_dir():
         raise RuntimeError(f"Source folder does not exist: {folder}")
+
+    # Annotation sidecars are the source of truth for QC navigation. The CSV is
+    # a derived export that can be stale or incomplete after images are added.
+    if any(folder.glob(f"*{ANNOTATION_METADATA_FILE_SUFFIX}")):
+        return load_annotation_metadata_entries(folder), None
+
     csv_path = output_file.expanduser().resolve() if output_file is not None else folder / DEFAULT_OUTPUT_CSV_NAME
     if csv_path.exists():
         return load_csv_entries(folder, csv_path), csv_path

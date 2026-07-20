@@ -210,10 +210,21 @@ def read_area_rows(
     rows: list[dict[str, Any]] = []
     area_unit = f"{length_unit}^2"
     area_ratio = units_per_pixel * units_per_pixel
+    portable_scale_payload = json.loads(json.dumps(scale_payload))
+    portable_scale_payload["source_input"] = str(
+        portable_scale_payload.get("selected_image_name") or ""
+    )
+    portable_scale_payload["selected_image_path"] = str(
+        portable_scale_payload.get("selected_image_name") or ""
+    )
+    applies_to = portable_scale_payload.get("applies_to")
+    if isinstance(applies_to, dict):
+        applies_to["folder_path"] = "."
+
     scale_metadata = {
-        "scale_bar_config_path": str(scale_bar_config),
+        "scale_bar_config_path": scale_bar_config.name,
         "scale_bar_config_name": scale_bar_config.name,
-        **flatten_json_fields("scale_config", scale_payload),
+        **flatten_json_fields("scale_config", portable_scale_payload),
     }
 
     for annotation_path in annotation_paths:
@@ -222,8 +233,9 @@ def read_area_rows(
         annotation_metadata_payload = {
             key: value for key, value in payload.items() if key != "records"
         }
+        annotation_metadata_payload["image_path"] = image_name
         annotation_metadata = {
-            "annotation_metadata_path": str(annotation_path),
+            "annotation_metadata_path": annotation_path.name,
             "annotation_metadata_name": annotation_path.name,
             **flatten_json_fields("annotation", annotation_metadata_payload),
         }

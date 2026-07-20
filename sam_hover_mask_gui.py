@@ -353,7 +353,7 @@ def save_embedding_cache_for_image(
             "+00:00", "Z"
         ),
         "model_cache_token": model_cache_token,
-        "image_path": str(image_path),
+        "image_path": image_path.name,
         "image_name": image_path.name,
         "image_size_hw": [int(h), int(w)],
         "image_file_size_bytes": image_file_size,
@@ -1432,7 +1432,7 @@ class SamHoverMaskApp:
             "version": 1,
             "saved_at_utc": self._utc_now_iso(),
             "model_cache_token": model_cache_token,
-            "image_path": str(image_path),
+            "image_path": image_path.name,
             "image_name": image_path.name,
             "image_size_hw": [int(h), int(w)],
             "image_file_size_bytes": image_file_size,
