@@ -6,6 +6,7 @@ import ast
 import csv
 import json
 import math
+import re
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -261,6 +262,27 @@ def choose_existing_path(candidates: list[Path]) -> Path:
     return candidates[0]
 
 
+def natural_sort_key(value: str) -> tuple[int | str, ...]:
+    """Sort filenames as people expect: replicate_2 before replicate_10."""
+    return tuple(
+        int(part) if part.isdigit() else part.casefold()
+        for part in re.split(r"(\d+)", str(value))
+    )
+
+
+def sort_mask_entries(entries: list[MaskEntry]) -> list[MaskEntry]:
+    """Order replicates by image name, then masks by their saved mask number."""
+    return sorted(
+        entries,
+        key=lambda entry: (
+            natural_sort_key(entry.image_name),
+            natural_sort_key(entry.image_path.name),
+            entry.mask_number,
+            entry.mask_index,
+        ),
+    )
+
+
 def build_entry_from_csv_row(
     folder: Path,
     row: dict[str, Any],
@@ -324,7 +346,7 @@ def load_csv_entries(folder: Path, csv_path: Path) -> list[MaskEntry]:
         ]
     if not entries:
         raise RuntimeError(f"No mask rows found in output file: {csv_path}")
-    return entries
+    return sort_mask_entries(entries)
 
 
 def stringify_row_value(value: Any) -> str:
@@ -519,7 +541,7 @@ def load_annotation_metadata_entries(folder: Path) -> list[MaskEntry]:
         raise RuntimeError(
             f"No {DEFAULT_OUTPUT_CSV_NAME} or *{ANNOTATION_METADATA_FILE_SUFFIX} rows found in {folder}"
         )
-    return entries
+    return sort_mask_entries(entries)
 
 
 def load_mask_entries(folder: Path, output_file: Path | None = None) -> tuple[list[MaskEntry], Path | None]:
