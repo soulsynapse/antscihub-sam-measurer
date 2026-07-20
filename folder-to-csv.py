@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import sam_mask_engine as mask_engine
+
 
 ANNOTATION_METADATA_SUFFIX = ".sam_clicks.json"
 SCALE_BAR_CONFIG_SUFFIX = ".scale_bar_config.result.json"
@@ -194,6 +196,42 @@ def image_name_from_annotation(path: Path, payload: dict[str, Any]) -> str:
     return path.stem
 
 
+def recovered_mask_metadata(
+    annotation_metadata_path: Path,
+    payload: dict[str, Any],
+) -> dict[int, dict[str, Any]]:
+    """Recover mask metrics from the NPZ for older, incomplete sidecars."""
+    raw_shape = payload.get("image_size_hw")
+    if not isinstance(raw_shape, (list, tuple)) or len(raw_shape) != 2:
+        return {}
+    try:
+        image_shape_hw = (int(raw_shape[0]), int(raw_shape[1]))
+    except (TypeError, ValueError):
+        return {}
+    if image_shape_hw[0] <= 0 or image_shape_hw[1] <= 0:
+        return {}
+
+    try:
+        loaded = mask_engine.load_annotations(
+            annotation_metadata_path.with_suffix(".npz"),
+            annotation_metadata_path,
+            image_shape_hw,
+        )
+    except Exception:
+        return {}
+
+    recovered: dict[int, dict[str, Any]] = {}
+    for index, metadata in enumerate(loaded.session_metadata.values()):
+        if not isinstance(metadata, dict):
+            continue
+        try:
+            mask_index = int(metadata.get("mask_index", index))
+        except (TypeError, ValueError):
+            mask_index = index
+        recovered[mask_index] = dict(metadata)
+    return recovered
+
+
 def read_area_rows(
     folder: Path,
     scale_bar_config: Path,
@@ -230,6 +268,7 @@ def read_area_rows(
     for annotation_path in annotation_paths:
         payload = load_json_object(annotation_path)
         image_name = image_name_from_annotation(annotation_path, payload)
+        recovered_records = recovered_mask_metadata(annotation_path, payload)
         annotation_metadata_payload = {
             key: value for key, value in payload.items() if key != "records"
         }
@@ -247,7 +286,17 @@ def read_area_rows(
             if not isinstance(record, dict):
                 continue
 
-            raw_area = record.get("mask_area_px")
+            raw_mask_index = record.get("mask_index", index)
+            try:
+                mask_index = int(raw_mask_index)
+            except (TypeError, ValueError):
+                mask_index = index
+
+            record_for_csv = dict(record)
+            for key, value in recovered_records.get(mask_index, {}).items():
+                record_for_csv.setdefault(key, value)
+
+            raw_area = record_for_csv.get("mask_area_px")
             if raw_area is None:
                 continue
 
@@ -256,7 +305,6 @@ def read_area_rows(
             except (TypeError, ValueError):
                 continue
 
-            raw_mask_index = record.get("mask_index", index)
             try:
                 click_number = int(raw_mask_index) + 1
             except (TypeError, ValueError):
@@ -272,7 +320,7 @@ def read_area_rows(
                     "computed_area_unit": area_unit,
                     **scale_metadata,
                     **annotation_metadata,
-                    **flatten_json_fields("record", record),
+                    **flatten_json_fields("record", record_for_csv),
                 }
             )
 
