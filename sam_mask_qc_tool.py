@@ -5,6 +5,7 @@ from version import __version__
 import ast
 import csv
 import json
+import math
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,9 @@ SCALE_BAR_CONFIG_SUFFIX = ".scale_bar_config.result.json"
 BACKGROUND_DIM_FACTOR = 0.25
 BBOX_BORDER_WIDTH = 1
 ZOOM_STEP_FACTOR = 1.12
+MANUAL_MEASURE_COLOR = "#ff2dd2"
+MANUAL_MEASURE_HIT_RADIUS_PX = 8.0
+MINIMUM_MANUAL_MEASURE_LENGTH_PX = 1.0
 
 # Keep these labels/colors matched with sam_hover_mask_gui.py without importing
 # the full model-loading GUI.
@@ -177,6 +181,43 @@ def format_value(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:.12g}"
     return str(value)
+
+
+def normalise_manual_measures(value: Any) -> list[dict[str, Any]]:
+    """Return valid persisted manual line measurements in the current format."""
+    raw_measures = parse_jsonish(value)
+    if not isinstance(raw_measures, list):
+        return []
+
+    measures: list[dict[str, Any]] = []
+    for raw_measure in raw_measures:
+        if not isinstance(raw_measure, dict):
+            continue
+        point_a = parse_jsonish(raw_measure.get("point_a_xy"))
+        point_b = parse_jsonish(raw_measure.get("point_b_xy"))
+        if (
+            not isinstance(point_a, (list, tuple))
+            or not isinstance(point_b, (list, tuple))
+            or len(point_a) != 2
+            or len(point_b) != 2
+        ):
+            continue
+        try:
+            ax, ay = float(point_a[0]), float(point_a[1])
+            bx, by = float(point_b[0]), float(point_b[1])
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(component) for component in (ax, ay, bx, by)):
+            continue
+        distance_px = math.hypot(bx - ax, by - ay)
+        measures.append(
+            {
+                "point_a_xy": [ax, ay],
+                "point_b_xy": [bx, by],
+                "distance_px": distance_px,
+            }
+        )
+    return measures
 
 
 def resolve_path(raw_path: Any, folder: Path) -> Path | None:
@@ -671,6 +712,9 @@ class SamMaskQcApp:
         self.current_caliper: mask_engine.MaskCaliperResult | None = None
         self.current_hull: mask_engine.MaskHullResult | None = None
         self.current_ellipse: mask_engine.MaskEllipseResult | None = None
+        self.current_manual_measures: list[dict[str, Any]] = []
+        self._manual_drag_start_xy: tuple[float, float] | None = None
+        self._manual_drag_item_id: int | None = None
         self.raw_view_hold = False
         self._table_value_labels: list[ttk.Label] = []
 
@@ -814,6 +858,10 @@ class SamMaskQcApp:
         self.canvas.bind("<ButtonPress-2>", self._on_middle_mouse_down)
         self.canvas.bind("<B2-Motion>", self._on_middle_mouse_drag)
         self.canvas.bind("<ButtonRelease-2>", self._on_middle_mouse_up)
+        self.canvas.bind("<ButtonPress-1>", self._on_manual_measure_down)
+        self.canvas.bind("<B1-Motion>", self._on_manual_measure_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_manual_measure_up)
+        self.canvas.bind("<ButtonPress-3>", self._on_manual_measure_right_click)
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
         self.canvas.bind("<Shift-MouseWheel>", self._on_mouse_wheel)
         self.canvas.bind("<Button-4>", self._on_mouse_wheel)
@@ -1030,6 +1078,207 @@ class SamMaskQcApp:
             pass
         return "break"
 
+    def _image_point_from_event(self, event: tk.Event) -> tuple[float, float] | None:
+        if self.current_image is None:
+            return None
+        width, height = self.current_image.size
+        zoom = max(float(self.zoom_factor), 1e-6)
+        image_x = float(self.canvas.canvasx(event.x)) / zoom - 0.5
+        image_y = float(self.canvas.canvasy(event.y)) / zoom - 0.5
+        return (
+            self._clamp(image_x, 0.0, float(max(0, width - 1))),
+            self._clamp(image_y, 0.0, float(max(0, height - 1))),
+        )
+
+    def _canvas_point_for_image_point(self, point_xy: tuple[float, float]) -> tuple[float, float]:
+        zoom = float(self.zoom_factor)
+        return ((float(point_xy[0]) + 0.5) * zoom, (float(point_xy[1]) + 0.5) * zoom)
+
+    def _draw_manual_measures(self) -> None:
+        for measure in self.current_manual_measures:
+            point_a = measure["point_a_xy"]
+            point_b = measure["point_b_xy"]
+            ax, ay = self._canvas_point_for_image_point((float(point_a[0]), float(point_a[1])))
+            bx, by = self._canvas_point_for_image_point((float(point_b[0]), float(point_b[1])))
+            self.canvas.create_line(
+                ax,
+                ay,
+                bx,
+                by,
+                fill=MANUAL_MEASURE_COLOR,
+                width=1,
+                tags=("manual_measure",),
+            )
+            self.canvas.create_oval(
+                ax - 2.5,
+                ay - 2.5,
+                ax + 2.5,
+                ay + 2.5,
+                fill=MANUAL_MEASURE_COLOR,
+                outline="#33002b",
+                tags=("manual_measure",),
+            )
+            self.canvas.create_oval(
+                bx - 2.5,
+                by - 2.5,
+                bx + 2.5,
+                by + 2.5,
+                fill=MANUAL_MEASURE_COLOR,
+                outline="#33002b",
+                tags=("manual_measure",),
+            )
+
+    def _metadata_record_for_entry(
+        self,
+        payload: dict[str, Any],
+        entry: MaskEntry,
+    ) -> dict[str, Any]:
+        records = payload.get("records")
+        if not isinstance(records, list):
+            raise RuntimeError(f"Annotation metadata has no records list: {entry.metadata_path}")
+        for record in records:
+            if isinstance(record, dict) and parse_int_like(record.get("mask_index")) == entry.mask_index:
+                return record
+        if 0 <= entry.mask_index < len(records) and isinstance(records[entry.mask_index], dict):
+            return records[entry.mask_index]
+        raise RuntimeError(
+            f"Could not find mask index {entry.mask_index} in annotation metadata: {entry.metadata_path}"
+        )
+
+    def _load_manual_measures(self, entry: MaskEntry) -> list[dict[str, Any]]:
+        if not entry.metadata_path.exists():
+            return []
+        try:
+            payload = load_json_object(entry.metadata_path)
+            record = self._metadata_record_for_entry(payload, entry)
+        except Exception:
+            return []
+        return normalise_manual_measures(record.get("manual_measures"))
+
+    def _save_current_manual_measures(self) -> None:
+        entry = self.current_entry
+        if entry is None:
+            raise RuntimeError("No replicate is selected.")
+        if not entry.metadata_path.exists():
+            raise RuntimeError(f"Annotation metadata JSON not found: {entry.metadata_path}")
+        payload = load_json_object(entry.metadata_path)
+        record = self._metadata_record_for_entry(payload, entry)
+        if self.current_manual_measures:
+            record["manual_measures"] = self.current_manual_measures
+        else:
+            record.pop("manual_measures", None)
+        mask_engine.write_json_atomic(entry.metadata_path, payload)
+        self.current_record_metadata["manual_measures"] = list(self.current_manual_measures)
+
+    def _refresh_manual_measurements(self) -> None:
+        if self.current_entry is None:
+            return
+        image_size = self.current_image.size if self.current_image is not None else None
+        self._populate_stats(
+            self.current_entry,
+            self.current_record_metadata,
+            self.current_bbox,
+            image_size,
+        )
+        self._draw_current_view()
+
+    def _on_manual_measure_down(self, event: tk.Event) -> str:
+        self._manual_drag_start_xy = self._image_point_from_event(event)
+        self._manual_drag_item_id = None
+        return "break"
+
+    def _on_manual_measure_drag(self, event: tk.Event) -> str:
+        if self._manual_drag_start_xy is None:
+            return "break"
+        end_xy = self._image_point_from_event(event)
+        if end_xy is None:
+            return "break"
+        start_canvas_xy = self._canvas_point_for_image_point(self._manual_drag_start_xy)
+        end_canvas_xy = self._canvas_point_for_image_point(end_xy)
+        if self._manual_drag_item_id is None:
+            self._manual_drag_item_id = self.canvas.create_line(
+                *start_canvas_xy,
+                *end_canvas_xy,
+                fill=MANUAL_MEASURE_COLOR,
+                width=1,
+                tags=("manual_measure_draft",),
+            )
+        else:
+            self.canvas.coords(self._manual_drag_item_id, *start_canvas_xy, *end_canvas_xy)
+        return "break"
+
+    def _on_manual_measure_up(self, event: tk.Event) -> str:
+        start_xy = self._manual_drag_start_xy
+        self._manual_drag_start_xy = None
+        if self._manual_drag_item_id is not None:
+            self.canvas.delete(self._manual_drag_item_id)
+            self._manual_drag_item_id = None
+        end_xy = self._image_point_from_event(event)
+        if start_xy is None or end_xy is None:
+            return "break"
+        distance_px = math.dist(start_xy, end_xy)
+        if distance_px < MINIMUM_MANUAL_MEASURE_LENGTH_PX:
+            return "break"
+
+        new_measure = {
+            "point_a_xy": [float(start_xy[0]), float(start_xy[1])],
+            "point_b_xy": [float(end_xy[0]), float(end_xy[1])],
+            "distance_px": float(distance_px),
+        }
+        self.current_manual_measures.append(new_measure)
+        try:
+            self._save_current_manual_measures()
+        except Exception as exc:
+            self.current_manual_measures.pop()
+            messagebox.showerror("SAM Mask QC", f"Could not save manual measure:\n{exc}", parent=self.root)
+            self._draw_current_view()
+            return "break"
+        self._refresh_manual_measurements()
+        return "break"
+
+    def _manual_measure_index_at_event(self, event: tk.Event) -> int | None:
+        click_x = float(self.canvas.canvasx(event.x))
+        click_y = float(self.canvas.canvasy(event.y))
+        closest_index: int | None = None
+        closest_distance = float("inf")
+        for index, measure in enumerate(self.current_manual_measures):
+            point_a = measure["point_a_xy"]
+            point_b = measure["point_b_xy"]
+            ax, ay = self._canvas_point_for_image_point((float(point_a[0]), float(point_a[1])))
+            bx, by = self._canvas_point_for_image_point((float(point_b[0]), float(point_b[1])))
+            dx = bx - ax
+            dy = by - ay
+            segment_length_sq = dx * dx + dy * dy
+            if segment_length_sq <= 1e-9:
+                distance = math.hypot(click_x - ax, click_y - ay)
+            else:
+                t = self._clamp(
+                    ((click_x - ax) * dx + (click_y - ay) * dy) / segment_length_sq,
+                    0.0,
+                    1.0,
+                )
+                distance = math.hypot(click_x - (ax + t * dx), click_y - (ay + t * dy))
+            if distance < closest_distance:
+                closest_index = index
+                closest_distance = distance
+        if closest_distance <= MANUAL_MEASURE_HIT_RADIUS_PX:
+            return closest_index
+        return None
+
+    def _on_manual_measure_right_click(self, event: tk.Event) -> str:
+        index = self._manual_measure_index_at_event(event)
+        if index is None:
+            return "break"
+        removed_measure = self.current_manual_measures.pop(index)
+        try:
+            self._save_current_manual_measures()
+        except Exception as exc:
+            self.current_manual_measures.insert(index, removed_measure)
+            messagebox.showerror("SAM Mask QC", f"Could not remove manual measure:\n{exc}", parent=self.root)
+            return "break"
+        self._refresh_manual_measurements()
+        return "break"
+
     def _adjust_zoom(self, steps: int, focus_canvas: tuple[float, float] | None = None) -> None:
         if self.current_image is None:
             return
@@ -1162,6 +1411,7 @@ class SamMaskQcApp:
         self.preview_photo = ImageTk.PhotoImage(preview)
         self.canvas.delete("all")
         self.canvas.create_image(origin_xy[0], origin_xy[1], anchor="nw", image=self.preview_photo)
+        self._draw_manual_measures()
         source_label = self.source_file.name if self.source_file is not None else "annotation metadata"
         width, height = self.current_image.size
         suffix = " | raw" if raw_view else ""
@@ -1206,6 +1456,9 @@ class SamMaskQcApp:
         self.current_caliper = None
         self.current_hull = None
         self.current_ellipse = None
+        self.current_manual_measures = []
+        self._manual_drag_start_xy = None
+        self._manual_drag_item_id = None
         self.raw_view_hold = False
         self.root.title(f"SAM Mask QC - {folder.name}")
         self._render_current()
@@ -1313,6 +1566,11 @@ class SamMaskQcApp:
                 ignore_mask_metadata=loaded.ignore_mask_metadata,
             )
             record_metadata = self._record_metadata_for_mask(loaded, entry.mask_index)
+            manual_measures = self._load_manual_measures(entry)
+            if manual_measures:
+                record_metadata["manual_measures"] = manual_measures
+            else:
+                record_metadata.pop("manual_measures", None)
             bbox = self._bbox_for_entry(entry, record_metadata, binary_mask, image.size)
             self.current_image = image
             self.current_binary_mask = np.asarray(binary_mask, dtype=bool)
@@ -1322,6 +1580,9 @@ class SamMaskQcApp:
             self.current_caliper = None
             self.current_hull = None
             self.current_ellipse = None
+            self.current_manual_measures = manual_measures
+            self._manual_drag_start_xy = None
+            self._manual_drag_item_id = None
             self.raw_view_hold = False
             self.zoom_factor = 1.0
             self._set_scrollregion()
@@ -1344,6 +1605,9 @@ class SamMaskQcApp:
             self.current_caliper = None
             self.current_hull = None
             self.current_ellipse = None
+            self.current_manual_measures = []
+            self._manual_drag_start_xy = None
+            self._manual_drag_item_id = None
             self.raw_view_hold = False
             self.canvas.delete("all")
             self.canvas.configure(scrollregion=(0, 0, 0, 0))
@@ -1396,6 +1660,14 @@ class SamMaskQcApp:
             if scale is not None:
                 caliper_length = self.current_caliper.distance_px * scale.units_per_pixel
                 summary_rows.append((f"caliper_{scale.length_unit}", f"{caliper_length:.6g}"))
+        for manual_index, manual_measure in enumerate(self.current_manual_measures, start=1):
+            distance_px = float(manual_measure["distance_px"])
+            summary_rows.append((f"manual_measure_{manual_index}_pixels", f"{distance_px:.3f}"))
+            if scale is not None:
+                manual_length = distance_px * scale.units_per_pixel
+                summary_rows.append(
+                    (f"manual_measure_{manual_index}_{scale.length_unit}", f"{manual_length:.6g}")
+                )
         if bool(self.show_hull_var.get()) and self.current_hull is not None:
             summary_rows.append(("hull_area_pixels", f"{self.current_hull.area_px:.3f}"))
             if self.current_hull.solidity is not None:

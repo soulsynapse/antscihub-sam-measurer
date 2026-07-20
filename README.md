@@ -180,7 +180,7 @@ Run the QC viewer with:
 python sam_mask_qc_tool.py "path\to\image-folder"
 ```
 
-The QC tool lets you quickly step through masks, inspect the masked subject, view the stats table, and see scale-derived values when a scale-bar config is available.
+The QC tool lets you quickly step through masks, inspect the masked subject, view the stats table, and see scale-derived values when a scale-bar config is available. Drag on the selected replicate to add a neon-magenta manual line measurement; it is saved to that replicate's `manual_measures` field in the annotation JSON and appears in the summary in pixels (and calibrated units when available). Right-click a manual line to remove it.
 
 ## Batch Processing
 
