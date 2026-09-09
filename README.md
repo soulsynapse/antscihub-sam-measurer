@@ -97,26 +97,58 @@ If you already cloned the folder earlier, open that folder in VS Code and update
 git pull
 ```
 
-In the VS Code terminal, create a virtual environment in this folder and install the requirements:
+In the VS Code terminal, create the virtual environment and install into it by full path. Calling `.venv\Scripts\python.exe` directly instead of activating first is deliberate: activation is the step that silently fails on Windows, and skipping it removes the most common cause of a broken install.
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+Now point VS Code at that same interpreter, or the play button will run a different Python than the one you just installed into: `Ctrl`+`Shift`+`P`, then `Python: Select Interpreter`, then the entry ending in `.venv\Scripts\python.exe`. Close and reopen any terminal you already had open.
+
+Verify before going further:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import sys, numpy, PIL, onnxruntime, gdown, tkinter; print(sys.executable)"
+```
+
+It should print one path ending in `antscihub-sam-measurer\.venv\Scripts\python.exe` and nothing else. A `ModuleNotFoundError` here means the packages landed somewhere other than `.venv`; see the troubleshooting section below.
 
 If setup worked, you should have:
 
 - VS Code open to the `antscihub-sam-measurer` folder.
 - A `.venv` virtual environment inside the folder.
-- The packages from `requirements.txt` installed.
-- A terminal that is ready to run the tools below.
+- The packages from `requirements.txt` installed into that `.venv`, confirmed by the check above.
+- The VS Code interpreter set to `.venv\Scripts\python.exe`.
 
-Required packages include `onnxruntime`, `numpy`, `Pillow`, and `gdown`.
+Required packages are `onnxruntime`, `numpy`, `Pillow`, and `gdown`. The GUI tools also need `tkinter`, which ships with the python.org Windows installer but is missing from some minimal or Microsoft Store builds.
 
-Once you have it in vscode, you can click any file and click the play button and it'll prompt you to open folders, which file you want, etc. You can run it typing into terminal if you want though.
+Once you have it in vscode, you can click any file and click the play button and it'll prompt you to open folders, which file you want, etc. You can run it typing into terminal if you want though. Every command below is written as `python ...`; if you did not activate the environment, substitute `.\.venv\Scripts\python.exe ...`.
+
+### Troubleshooting: `ModuleNotFoundError: No module named 'numpy'`
+
+This almost always means two different Pythons: pip installed into one, and your script ran in another. Nothing is corrupt and nothing needs reinstalling from PyPI — the packages are on the machine, just not where the running interpreter looks.
+
+Find out which interpreter is actually running your code. In the same terminal where the error appeared:
+
+```powershell
+python -c "import sys; print(sys.executable)"
+```
+
+Compare that against the interpreter VS Code shows in the bottom-right status bar. If either one is not the `.venv` path, that is the bug. Common causes:
+
+- **Activation was refused and you did not notice.** On a default Windows install, `.\.venv\Scripts\Activate.ps1` fails with *"running scripts is disabled on this system"*, PowerShell keeps going, and `pip install` quietly targets the global Python. Either allow local scripts once, with `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`, or skip activation entirely and keep calling `.\.venv\Scripts\python.exe`.
+- **The prompt does not start with `(.venv)`.** That is the tell that activation did not take, whatever the terminal printed.
+- **VS Code's play button disagrees with your terminal.** VS Code auto-detects `.venv` and runs the script with it even when your terminal is using the global Python, so an install done outside the venv produces exactly this error only when you press play. Re-run `Python: Select Interpreter` and reinstall by full path.
+- **`python` is the Microsoft Store stub.** It opens the Store, or creates a `.venv` that behaves oddly. Use `py -3 -m venv .venv` instead, or turn off `python.exe` under Settings, Apps, Advanced app settings, App execution aliases.
+
+To start over cleanly, delete the environment and redo the three install commands:
+
+```powershell
+Remove-Item -Recurse -Force .venv
+```
+
 
 
 ## Typical Workflow
