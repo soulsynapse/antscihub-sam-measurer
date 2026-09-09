@@ -34,6 +34,8 @@ VENV_DIR = REPO_DIR / ".venv"
 GUARD_ENV_VAR = "SAM_MEASURER_ENV_REPAIRED"
 # Escape hatch for anyone managing the environment themselves.
 SKIP_ENV_VAR = "SAM_MEASURER_SKIP_BOOTSTRAP"
+# Suppresses the failure popup, which would otherwise block an unattended run.
+NO_DIALOG_ENV_VAR = "SAM_MEASURER_NO_DIALOG"
 
 _REQUIREMENT_RE = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(?:(>=|==|~=|>)\s*([0-9][^,;\s]*))?"
@@ -101,7 +103,18 @@ def _report(message: str) -> None:
 
 
 def _show_dialog(title: str, message: str) -> None:
-    """Best-effort popup, for users who launched without a visible terminal."""
+    """Best-effort popup for users who launched without a readable terminal.
+
+    Modal, so it is skipped whenever stderr is a terminal the user can already
+    read, and whenever the popup is suppressed outright.
+    """
+    if os.environ.get(NO_DIALOG_ENV_VAR):
+        return
+    try:
+        if sys.stderr is not None and sys.stderr.isatty():
+            return
+    except Exception:
+        pass
     try:
         import tkinter as tk
         from tkinter import messagebox

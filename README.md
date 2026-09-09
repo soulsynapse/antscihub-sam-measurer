@@ -122,6 +122,14 @@ Required packages are `onnxruntime`, `numpy`, `Pillow`, and `gdown`. The GUI too
 
 Once you have it in vscode, you can click any file and click the play button and it'll prompt you to open folders, which file you want, etc. You can run it typing into terminal if you want though. Every command below is written as `python ...`; if you did not activate the environment, substitute `.\.venv\Scripts\python.exe ...`.
 
+### Self-repair
+
+`sam_hover_mask_gui.py` checks its own environment before it imports anything, via `env_bootstrap.py`. If a package from `requirements.txt` is missing or older than its pin, it installs the requirements into the correct interpreter and relaunches itself there, so a broken environment usually costs one slow start rather than an error. Watch the terminal for `[env]` lines while that happens.
+
+It targets the environment you are already in if you launched from a virtual environment, including conda, and otherwise creates or repairs `.venv` in the project folder. If the repair itself fails it stops with the exact command to run by hand rather than retrying. Set `SAM_MEASURER_SKIP_BOOTSTRAP=1` to turn the check off if you manage the environment yourself.
+
+The check is not a substitute for a correct install: it cannot add `tkinter`, and it will not rescue an interpreter that VS Code is not actually using.
+
 ### Troubleshooting: `ModuleNotFoundError: No module named 'numpy'`
 
 This almost always means two different Pythons: pip installed into one, and your script ran in another. Nothing is corrupt and nothing needs reinstalling from PyPI — the packages are on the machine, just not where the running interpreter looks.
