@@ -91,11 +91,7 @@ cd antscihub-sam-measurer
 code .
 ```
 
-If you already cloned the folder earlier, open that folder in VS Code and update it with:
-
-```powershell
-git pull
-```
+If you already cloned the folder earlier, open that folder in VS Code and follow [Update](#update) instead of the steps below.
 
 In the VS Code terminal, create the virtual environment and install into it by full path. Calling `.venv\Scripts\python.exe` directly instead of activating first is deliberate: activation is the step that silently fails on Windows, and skipping it removes the most common cause of a broken install.
 
@@ -149,6 +145,29 @@ To start over cleanly, delete the environment and redo the three install command
 Remove-Item -Recurse -Force .venv
 ```
 
+
+
+
+## Update
+
+To pull the latest version of the tool, run both of these from the `antscihub-sam-measurer` folder in the VS Code terminal:
+
+```powershell
+git pull
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+The second command is not optional even when nothing looks like it changed. `requirements.txt` can gain or bump a package in any pull, and installing by full path targets the environment VS Code actually runs, whether or not activation ever worked in your terminal.
+
+Confirm the environment is intact afterward:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import numpy, PIL, onnxruntime, gdown, tkinter; print('ok')"
+```
+
+If that prints anything other than `ok`, see the troubleshooting section above. If `git pull` refuses because you have local edits you do not want, `git stash` first and `git stash pop` afterward.
+
+Downloaded model weights in `models/` and your annotation files are untouched by an update, so nothing needs re-downloading or re-clicking.
 
 
 ## Typical Workflow

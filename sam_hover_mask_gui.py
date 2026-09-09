@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+# Must precede every third-party import: repairs the virtual environment and
+# relaunches if the packages are missing. See env_bootstrap.py.
+import env_bootstrap
+
+env_bootstrap.ensure_environment()
+
 import argparse
 from version import __version__
 import hashlib
